@@ -22,7 +22,6 @@ pub struct MidiApp {
     rx: Receiver<(Vec<u8>, Instant)>,
     log: Vec<String>,
     status: String,
-    auto_scroll: bool,
     tempo_bpm: u32,
     note_hits: Vec<NoteHit>,
     scroll_mode: ScrollMode,
@@ -30,7 +29,8 @@ pub struct MidiApp {
     measures: u32,
     log_width_frac: f32,
     chords: Vec<(u32, String)>,
-    pending_scroll_index: Option<usize>,
+    chords_auto_scroll: bool,
+    chord_pending_scroll_index: Option<usize>,
     scrolling_active: bool,
     frozen_view_end: Option<Instant>,
 
@@ -52,7 +52,6 @@ impl Default for MidiApp {
             rx,
             log: Vec::new(),
             status: "Idle".to_string(),
-            auto_scroll: true,
             tempo_bpm: 120,
             note_hits: Vec::new(),
             scroll_mode: ScrollMode::Smooth,
@@ -60,7 +59,8 @@ impl Default for MidiApp {
             measures: 2,
             log_width_frac: 0.35_f32,
             chords: vec![(0, "N.C.".to_string())],
-            pending_scroll_index: None,
+            chords_auto_scroll: true,
+            chord_pending_scroll_index: None,
             scrolling_active: false,
             frozen_view_end: None,
 
@@ -136,7 +136,8 @@ impl MidiApp {
             // clear start_time so no new chords are generated while closed
             self.start_time = None;
             // prevent automatic scroll of the chord strip
-            self.pending_scroll_index = None;
+            self.chord_pending_scroll_index = None;
+
         } else {
             self.status = "No open connection".to_string();
         }
@@ -156,9 +157,12 @@ impl MidiApp {
                     NoteAction::On { pc, vel, time } => {
                         // start scrolling from the first Note On timestamp
                         if self.start_time.is_none() {
+                            // reset start state and clear generated chords so the chord cards restart from measure 1
                             self.start_time = Some(time);
                             self.scrolling_active = true;
                             self.frozen_view_end = None;
+                            self.chords.clear();
+                            self.chords.push((0, "N.C.".to_string()));
                         }
                         self.note_hits.push(NoteHit { pitch_class: pc, start: time, end: None, velocity: vel });
                     }
@@ -183,7 +187,9 @@ impl MidiApp {
         while next <= up_to {
             let chord = generate_chord_for_measure(next);
             self.chords.push((next, chord));
-            self.pending_scroll_index = Some(self.chords.len() - 1);
+            if self.chords_auto_scroll {
+                self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+            }
             next += 1;
         }
     }
@@ -197,7 +203,7 @@ impl eframe::App for MidiApp {
             // Menu bar for settings
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Settings", |ui| {
-                    ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
+
                     ui.separator();
                     ui.label("Scroll Mode:");
                     ui.radio_value(&mut self.scroll_mode, ScrollMode::Smooth, "Smooth");
@@ -279,20 +285,10 @@ impl eframe::App for MidiApp {
                     ui_left.heading("MIDI Event History");
                     ui_left.separator();
                     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui_left, |ui_left| {
-                        let mut last_rect: Option<egui::Rect> = None;
-                        for (i, line) in self.log.iter().enumerate() {
-                            let resp = ui_left.label(line);
-                            if i + 1 == self.log.len() {
-                                last_rect = Some(resp.rect);
-                            }
+                        for line in &self.log {
+                            ui_left.label(line);
                         }
                         ui_left.add_space(bottom_padding);
-                        if self.auto_scroll {
-                            if let Some(rect) = last_rect {
-                                ui_left.scroll_to_rect(rect, Some(egui::Align::Max));
-                                ui_left.ctx().request_repaint();
-                            }
-                        }
                     });
                 });
 
@@ -582,10 +578,37 @@ impl eframe::App for MidiApp {
 
             // Chord window (full width) — displays horizontally scrollable chord cards
             ui.separator();
-            ui.heading("Chord");
+            ui.horizontal(|ui| {
+                ui.heading("Chord");
+                // push the toggle to the right but keep it inside the available area
+                let sz: f32 = 26.0;
+                let rem = ui.available_width();
+                let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
+                ui.add_space(push);
+
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                let resp = resp.on_hover_text("Auto-scroll chords");
+                // draw background indicating state
+                let painter = ui.painter_at(rect);
+                let bg = if self.chords_auto_scroll {
+                    egui::Color32::from_rgb(60, 145, 60)
+                } else {
+                    egui::Color32::from_rgb(70, 70, 70)
+                };
+                painter.rect_filled(rect, 4.0, bg);
+                // icon
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, "🔁", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+
+                if resp.clicked() {
+                    self.chords_auto_scroll = !self.chords_auto_scroll;
+                    if self.chords_auto_scroll && !self.chords.is_empty() {
+                        self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                    }
+                }
+            });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            egui::ScrollArea::horizontal().stick_to_right(true).max_height(card_h + 16.0).show(ui, |ui| {
+            egui::ScrollArea::horizontal().stick_to_right(self.chords_auto_scroll).max_height(card_h + 16.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut card_rects: Vec<egui::Rect> = Vec::new();
                     for (_i, (measure, chord)) in self.chords.iter().enumerate() {
@@ -596,7 +619,7 @@ impl eframe::App for MidiApp {
                         painter.text(rect.center(), egui::Align2::CENTER_CENTER, chord, egui::FontId::proportional(18.0), egui::Color32::WHITE);
                         card_rects.push(rect);
                     }
-                    if let Some(idx) = self.pending_scroll_index.take() {
+                    if let Some(idx) = self.chord_pending_scroll_index.take() {
                         if idx < card_rects.len() {
                             ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
                             ui.ctx().request_repaint();
@@ -604,16 +627,16 @@ impl eframe::App for MidiApp {
                     }
                 });
             });
-        });
 
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Status on the left
-                ui.label(format!("Status: {}", self.status));
-                ui.separator();
-                ui.label(format!("Ports: {}", self.ports.len()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("verichord — MIDI monitor");
+            egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Status on the left
+                    ui.label(format!("Status: {}", self.status));
+                    ui.separator();
+                    ui.label(format!("Ports: {}", self.ports.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label("verichord — MIDI monitor");
+                    });
                 });
             });
         });
