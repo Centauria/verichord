@@ -1,0 +1,13 @@
+[package]
+name = "verichord"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.24"
+midir = "0.8"
+wmidi = "4.0"
+# For timestamp formatting
+chrono = { version = "0.4", features = ["alloc"] }
+# Ensure winapi features used by eframe on Windows are enabled
+winapi = { version = "0.3", features = ["winuser", "windef"] }
