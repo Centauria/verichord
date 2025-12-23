@@ -37,6 +37,10 @@ pub struct MidiApp {
     // time signature a/b where a in 1..=16 and b in {2,4,8,16}
     time_sig_a: u8,
     time_sig_b: u32,
+    log_auto_scroll: bool,
+    log_pending_scroll: bool,
+    last_log_scroll_offset: Option<f32>,
+    last_chord_scroll_offset: Option<f32>,
 } 
 
 impl Default for MidiApp {
@@ -66,6 +70,10 @@ impl Default for MidiApp {
 
             time_sig_a: 4,
             time_sig_b: 4,
+            log_auto_scroll: true,
+            log_pending_scroll: false,
+            last_log_scroll_offset: None,
+            last_chord_scroll_offset: None,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -179,6 +187,10 @@ impl MidiApp {
             if self.log.len() > 1000 {
                 self.log.drain(0..200);
             }
+            if self.log_auto_scroll {
+                // request a forced scroll to bottom on next UI update
+                self.log_pending_scroll = true;
+            }
         }
     }
 
@@ -282,14 +294,68 @@ impl eframe::App for MidiApp {
             ui.horizontal(|ui_row| {
                 // LEFT PANE (Log)
                 ui_row.allocate_ui_with_layout(egui::vec2(left_w, height), egui::Layout::top_down(egui::Align::Min), |ui_left| {
-                    ui_left.heading("MIDI Event History");
+                    ui_left.horizontal(|ui| {
+                        ui.heading("MIDI Event History");
+                        // push the toggle to the right but keep it inside the available area
+                        let sz: f32 = 26.0;
+                        let rem = ui.available_width();
+                        let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
+                        ui.add_space(push);
+
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                        let resp = resp.on_hover_text("Auto-scroll log");
+                        // draw background indicating state
+                        let painter = ui.painter_at(rect);
+                        let bg = if self.log_auto_scroll {
+                            egui::Color32::from_rgb(60, 145, 60)
+                        } else {
+                            egui::Color32::from_rgb(70, 70, 70)
+                        };
+                        painter.rect_filled(rect, 4.0, bg);
+                        // icon
+                        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "🔁", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+
+                        if resp.clicked() {
+                            self.log_auto_scroll = !self.log_auto_scroll;
+                            if self.log_auto_scroll && !self.log.is_empty() {
+                                self.log_pending_scroll = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    });
                     ui_left.separator();
-                    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui_left, |ui_left| {
+                    let log_scroll_output = egui::ScrollArea::vertical().stick_to_bottom(self.log_auto_scroll).auto_shrink([false; 2]).show(ui_left, |ui_left| {
+                        let mut line_rects: Vec<egui::Rect> = Vec::new();
                         for line in &self.log {
-                            ui_left.label(line);
+                            let resp = ui_left.label(line);
+                            line_rects.push(resp.rect);
                         }
                         ui_left.add_space(bottom_padding);
+
+                        // If a forced scroll was requested (new entries while auto-scroll enabled), scroll to the last line
+                        if self.log_pending_scroll {
+                            if let Some(last_rect) = line_rects.last() {
+                                ui_left.scroll_to_rect(*last_rect, Some(egui::Align::Max));
+                                ui_left.ctx().request_repaint();
+                            }
+                            self.log_pending_scroll = false;
+                        }
                     });
+
+                    // Detect user manual scrolling (scrolling up) and disable auto-scroll
+                    if self.log_auto_scroll {
+                        let current_offset = log_scroll_output.state.offset.y;
+                        if let Some(last_offset) = self.last_log_scroll_offset {
+                            // If user scrolled up (offset decreased) and it's not due to pending scroll, disable auto-scroll
+                            if current_offset < last_offset - 1.0 {
+                                self.log_auto_scroll = false;
+                            }
+                        }
+                        self.last_log_scroll_offset = Some(current_offset);
+                    } else {
+                        // When auto-scroll is off, still track offset for when it's re-enabled
+                        self.last_log_scroll_offset = Some(log_scroll_output.state.offset.y);
+                    }
                 });
 
                 // Handle (draggable)
@@ -603,12 +669,13 @@ impl eframe::App for MidiApp {
                     self.chords_auto_scroll = !self.chords_auto_scroll;
                     if self.chords_auto_scroll && !self.chords.is_empty() {
                         self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                        ui.ctx().request_repaint();
                     }
                 }
             });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            egui::ScrollArea::horizontal().stick_to_right(self.chords_auto_scroll).max_height(card_h + 16.0).show(ui, |ui| {
+            let chord_scroll_output = egui::ScrollArea::horizontal().stick_to_right(self.chords_auto_scroll).max_height(card_h + 16.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut card_rects: Vec<egui::Rect> = Vec::new();
                     for (_i, (measure, chord)) in self.chords.iter().enumerate() {
@@ -627,6 +694,21 @@ impl eframe::App for MidiApp {
                     }
                 });
             });
+
+            // Detect user manual scrolling (scrolling left) and disable auto-scroll
+            if self.chords_auto_scroll {
+                let current_offset = chord_scroll_output.state.offset.x;
+                if let Some(last_offset) = self.last_chord_scroll_offset {
+                    // If user scrolled left (offset decreased), disable auto-scroll
+                    if current_offset < last_offset - 1.0 {
+                        self.chords_auto_scroll = false;
+                    }
+                }
+                self.last_chord_scroll_offset = Some(current_offset);
+            } else {
+                // When auto-scroll is off, still track offset for when it's re-enabled
+                self.last_chord_scroll_offset = Some(chord_scroll_output.state.offset.x);
+            }
 
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
