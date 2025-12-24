@@ -121,8 +121,19 @@ impl MidiApp {
                 Ok(conn) => {
                     self.status = format!("Open: {}", port_name);
                     self.connection = Some(conn);
-                    // reset any frozen view; scrolling will begin on first Note On
-                    self.frozen_view_end = None;
+                    // Reset state for a fresh recording session: clear MIDI event log, piano hits, and chord cards.
+                    // Keep the frozen view (if any) so reopening doesn't cause the grid to jump; scrolling will begin on first Note On.
+                    self.log.clear();
+                    self.note_hits.clear();
+                    self.chords.clear();
+                    self.chords.push((0, "N.C.".to_string()));
+                    self.chord_pending_scroll_index = None;
+                    // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
+                    self.log_pending_scroll = false;
+                    self.last_log_scroll_offset = None;
+                    self.last_chord_scroll_offset = None;
+                    // ensure no chord generation until first Note On
+                    self.start_time = None;
                     self.scrolling_active = false;
                 }
                 Err(e) => {
@@ -593,7 +604,11 @@ impl eframe::App for MidiApp {
 
                     // chord generation per measure
                     if let Some(start) = self.start_time {
-                        let elapsed = view_end.duration_since(start).as_secs_f32();
+                        // Use actual current time (now) to determine which measures are active.
+                        // Using `view_end` (quantized in Bar mode) can cause an off-by-one where the view
+                        // is already snapped to the end of the first measure and we end up generating
+                        // both measure 1 and 2 at the same time. Using `now` avoids that.
+                        let elapsed = now.duration_since(start).as_secs_f32();
                         // Convert to 1-based measure index so the first active measure is measure 1
                         let current_measure_idx = (elapsed / measure_secs).floor() as u32 + 1;
                         self.ensure_chords_up_to(current_measure_idx);
