@@ -11,3 +11,4 @@ wmidi = "4.0"
 chrono = { version = "0.4", features = ["alloc"] }
 # Ensure winapi features used by eframe on Windows are enabled
 winapi = { version = "0.3", features = ["winuser", "windef"] }
+libloading = "0.8"

@@ -2,10 +2,10 @@ use chrono::Local;
 use eframe::{egui, egui::ComboBox};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Instant};
+use std::time::Instant;
 use wmidi::MidiMessage;
 
-use crate::midi::{NoteHit, NoteAction, parse_note_action, generate_chord_for_measure};
+use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum ScrollMode {
@@ -41,11 +41,17 @@ pub struct MidiApp {
     log_pending_scroll: bool,
     last_log_scroll_offset: Option<f32>,
     last_chord_scroll_offset: Option<f32>,
-} 
+
+    // algorithm plugins discovered in the executable directory
+    algos: Vec<crate::algo_load::AlgoLib>,
+    // index into `algos` for the selected algorithm (None == no plugin selected)
+    selected_algo_idx: Option<usize>,
+}
 
 impl Default for MidiApp {
     fn default() -> Self {
-        let midi_in = MidiInput::new("verichord").unwrap_or_else(|_| MidiInput::new("verichord-fallback").unwrap());
+        let midi_in = MidiInput::new("verichord")
+            .unwrap_or_else(|_| MidiInput::new("verichord-fallback").unwrap());
         let (tx, rx) = mpsc::channel();
         let mut app = MidiApp {
             midi_in,
@@ -74,9 +80,12 @@ impl Default for MidiApp {
             log_pending_scroll: false,
             last_log_scroll_offset: None,
             last_chord_scroll_offset: None,
+            algos: Vec::new(),
+            selected_algo_idx: None,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
+        app.refresh_algos();
         app
     }
 }
@@ -96,6 +105,28 @@ impl MidiApp {
         }
     }
 
+    /// Refresh the list of algorithm plugins found next to the running executable.
+    /// Keeps the currently selected index if it still exists; otherwise chooses
+    /// the first found plugin (if any).
+    fn refresh_algos(&mut self) {
+        match crate::algo_load::find_algos_in_exe_dir() {
+            Ok(list) => {
+                self.algos = list;
+                if self.selected_algo_idx.is_none() && !self.algos.is_empty() {
+                    self.selected_algo_idx = Some(0);
+                } else if let Some(idx) = self.selected_algo_idx {
+                    if idx >= self.algos.len() {
+                        self.selected_algo_idx = None;
+                    }
+                }
+            }
+            Err(_) => {
+                self.algos.clear();
+                self.selected_algo_idx = None;
+            }
+        }
+    }
+
     pub fn open_selected(&mut self, ctx: &egui::Context) {
         if self.connection.is_some() {
             self.status = "Already open".to_string();
@@ -108,16 +139,25 @@ impl MidiApp {
                 return;
             }
             let port = &ports[idx];
-            let port_name = self.midi_in.port_name(port).unwrap_or_else(|_| "Unnamed".to_string());
+            let port_name = self
+                .midi_in
+                .port_name(port)
+                .unwrap_or_else(|_| "Unnamed".to_string());
 
             // clone tx for callback
             let cb_tx = self.tx.clone();
             let ctx_clone = ctx.clone();
-            let connector = MidiInput::new("verichord-connection").unwrap_or_else(|_| MidiInput::new("verichord-conn-fallback").unwrap());
-            match connector.connect(port, "verichord-connection", move |_, message, _| {
-                let _ = cb_tx.send((message.to_vec(), Instant::now()));
-                ctx_clone.request_repaint();
-            }, ()) {
+            let connector = MidiInput::new("verichord-connection")
+                .unwrap_or_else(|_| MidiInput::new("verichord-conn-fallback").unwrap());
+            match connector.connect(
+                port,
+                "verichord-connection",
+                move |_, message, _| {
+                    let _ = cb_tx.send((message.to_vec(), Instant::now()));
+                    ctx_clone.request_repaint();
+                },
+                (),
+            ) {
                 Ok(conn) => {
                     self.status = format!("Open: {}", port_name);
                     self.connection = Some(conn);
@@ -156,7 +196,6 @@ impl MidiApp {
             self.start_time = None;
             // prevent automatic scroll of the chord strip
             self.chord_pending_scroll_index = None;
-
         } else {
             self.status = "No open connection".to_string();
         }
@@ -166,9 +205,15 @@ impl MidiApp {
         while let Ok((bytes, ts)) = self.rx.try_recv() {
             let time = Local::now();
             // format with wmidi when possible
-            let parsed = MidiMessage::try_from(bytes.as_slice()).map(|m| format!("{:?}", m)).unwrap_or_else(|_| {
-                bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
-            });
+            let parsed = MidiMessage::try_from(bytes.as_slice())
+                .map(|m| format!("{:?}", m))
+                .unwrap_or_else(|_| {
+                    bytes
+                        .iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
 
             // process note actions using helper from midi module
             if let Some(action) = parse_note_action(&bytes, ts) {
@@ -183,17 +228,32 @@ impl MidiApp {
                             self.chords.clear();
                             self.chords.push((0, "N.C.".to_string()));
                         }
-                        self.note_hits.push(NoteHit { pitch_class: pc, start: time, end: None, velocity: vel });
+                        self.note_hits.push(NoteHit {
+                            pitch_class: pc,
+                            start: time,
+                            end: None,
+                            velocity: vel,
+                        });
                     }
                     NoteAction::Off { pc, time } => {
-                        if let Some(hit) = self.note_hits.iter_mut().rev().find(|h| h.pitch_class == pc && h.end.is_none()) {
+                        if let Some(hit) = self
+                            .note_hits
+                            .iter_mut()
+                            .rev()
+                            .find(|h| h.pitch_class == pc && h.end.is_none())
+                        {
                             hit.end = Some(time);
                         }
                     }
                 }
             }
 
-            let entry = format!("{} [{} ms] {}", time.format("%H:%M:%S"), ts.elapsed().as_millis(), parsed);
+            let entry = format!(
+                "{} [{} ms] {}",
+                time.format("%H:%M:%S"),
+                ts.elapsed().as_millis(),
+                parsed
+            );
             self.log.push(entry);
             if self.log.len() > 1000 {
                 self.log.drain(0..200);
@@ -208,7 +268,10 @@ impl MidiApp {
     fn ensure_chords_up_to(&mut self, up_to: u32) {
         let mut next = self.chords.last().map(|(m, _)| m + 1).unwrap_or(0);
         while next <= up_to {
-            let chord = generate_chord_for_measure(next);
+            let sample_fn = self
+                .selected_algo_idx
+                .and_then(|idx| self.algos.get(idx).and_then(|a| a.sample_next_chord_fn()));
+            let chord = generate_chord_for_measure(next, sample_fn);
             self.chords.push((next, chord));
             if self.chords_auto_scroll {
                 self.chord_pending_scroll_index = Some(self.chords.len() - 1);
@@ -226,7 +289,6 @@ impl eframe::App for MidiApp {
             // Menu bar for settings
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Settings", |ui| {
-
                     ui.separator();
                     ui.label("Scroll Mode:");
                     ui.radio_value(&mut self.scroll_mode, ScrollMode::Smooth, "Smooth");
@@ -238,21 +300,34 @@ impl eframe::App for MidiApp {
                         style.interaction.tooltip_delay = 1.0;
                         ui.set_style(style);
                         ui.add(egui::Slider::new(&mut self.tempo_bpm, 40..=240).text("BPM"))
-                            .on_hover_text("BPM counts quarter notes. Example: 6/8 @100 -> 200 eighths/min");
+                            .on_hover_text(
+                                "BPM counts quarter notes. Example: 6/8 @100 -> 200 eighths/min",
+                            );
                     });
                     ui.add(egui::Slider::new(&mut self.measures, 1..=4).text("Measures"));
 
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Time signature");
-                        ui.add(egui::DragValue::new(&mut self.time_sig_a).clamp_range(1..=16).speed(0.25));
+                        ui.add(
+                            egui::DragValue::new(&mut self.time_sig_a)
+                                .clamp_range(1..=16)
+                                .speed(0.25),
+                        );
                         ui.label("/");
                         let prev_b = self.time_sig_b;
-                        ui.add(egui::DragValue::new(&mut self.time_sig_b).clamp_range(2..=16).speed(0.25));
+                        ui.add(
+                            egui::DragValue::new(&mut self.time_sig_b)
+                                .clamp_range(2..=16)
+                                .speed(0.25),
+                        );
                         if self.time_sig_b != prev_b && !matches!(self.time_sig_b, 2 | 4 | 8 | 16) {
                             // snap denominator to the nearest allowed value
                             let allowed = [2_u32, 4, 8, 16];
-                            if let Some(&closest) = allowed.iter().min_by_key(|v| (self.time_sig_b as i32 - **v as i32).abs()) {
+                            if let Some(&closest) = allowed
+                                .iter()
+                                .min_by_key(|v| (self.time_sig_b as i32 - **v as i32).abs())
+                            {
                                 self.time_sig_b = closest;
                             }
                         }
@@ -263,7 +338,12 @@ impl eframe::App for MidiApp {
             ui.horizontal(|ui| {
                 ui.label("MIDI Input:");
                 ComboBox::from_label("")
-                    .selected_text(self.selected.and_then(|i| self.ports.get(i)).cloned().unwrap_or("(none)".to_owned()))
+                    .selected_text(
+                        self.selected
+                            .and_then(|i| self.ports.get(i))
+                            .cloned()
+                            .unwrap_or("(none)".to_owned()),
+                    )
                     .show_ui(ui, |ui| {
                         for (i, name) in self.ports.iter().enumerate() {
                             ui.selectable_value(&mut self.selected, Some(i), name);
@@ -304,77 +384,94 @@ impl eframe::App for MidiApp {
             // Layout horizontally so panes are side-by-side
             ui.horizontal(|ui_row| {
                 // LEFT PANE (Log)
-                ui_row.allocate_ui_with_layout(egui::vec2(left_w, height), egui::Layout::top_down(egui::Align::Min), |ui_left| {
-                    ui_left.horizontal(|ui| {
-                        ui.heading("MIDI Event History");
-                        // push the toggle to the right but keep it inside the available area
-                        let sz: f32 = 26.0;
-                        let rem = ui.available_width();
-                        let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
-                        ui.add_space(push);
+                ui_row.allocate_ui_with_layout(
+                    egui::vec2(left_w, height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui_left| {
+                        ui_left.horizontal(|ui| {
+                            ui.heading("MIDI Event History");
+                            // push the toggle to the right but keep it inside the available area
+                            let sz: f32 = 26.0;
+                            let rem = ui.available_width();
+                            let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
+                            ui.add_space(push);
 
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
-                        let resp = resp.on_hover_text("Auto-scroll log");
-                        // draw background indicating state
-                        let painter = ui.painter_at(rect);
-                        let bg = if self.log_auto_scroll {
-                            egui::Color32::from_rgb(60, 145, 60)
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                            let resp = resp.on_hover_text("Auto-scroll log");
+                            // draw background indicating state
+                            let painter = ui.painter_at(rect);
+                            let bg = if self.log_auto_scroll {
+                                egui::Color32::from_rgb(60, 145, 60)
+                            } else {
+                                egui::Color32::from_rgb(70, 70, 70)
+                            };
+                            painter.rect_filled(rect, 4.0, bg);
+                            // icon
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "🔁",
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::WHITE,
+                            );
+
+                            if resp.clicked() {
+                                self.log_auto_scroll = !self.log_auto_scroll;
+                                if self.log_auto_scroll && !self.log.is_empty() {
+                                    self.log_pending_scroll = true;
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
+                        ui_left.separator();
+                        let log_scroll_output = egui::ScrollArea::vertical()
+                            .stick_to_bottom(self.log_auto_scroll)
+                            .auto_shrink([false; 2])
+                            .show(ui_left, |ui_left| {
+                                let mut line_rects: Vec<egui::Rect> = Vec::new();
+                                for line in &self.log {
+                                    let resp = ui_left.label(line);
+                                    line_rects.push(resp.rect);
+                                }
+                                ui_left.add_space(bottom_padding);
+
+                                // If a forced scroll was requested (new entries while auto-scroll enabled), scroll to the last line
+                                if self.log_pending_scroll {
+                                    if let Some(last_rect) = line_rects.last() {
+                                        ui_left.scroll_to_rect(*last_rect, Some(egui::Align::Max));
+                                        ui_left.ctx().request_repaint();
+                                    }
+                                    self.log_pending_scroll = false;
+                                }
+                            });
+
+                        // Detect user manual scrolling (scrolling up) and disable auto-scroll
+                        if self.log_auto_scroll {
+                            let current_offset = log_scroll_output.state.offset.y;
+                            if let Some(last_offset) = self.last_log_scroll_offset {
+                                // If user scrolled up (offset decreased) and it's not due to pending scroll, disable auto-scroll
+                                if current_offset < last_offset - 1.0 {
+                                    self.log_auto_scroll = false;
+                                }
+                            }
+                            self.last_log_scroll_offset = Some(current_offset);
                         } else {
-                            egui::Color32::from_rgb(70, 70, 70)
-                        };
-                        painter.rect_filled(rect, 4.0, bg);
-                        // icon
-                        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "🔁", egui::FontId::proportional(14.0), egui::Color32::WHITE);
-
-                        if resp.clicked() {
-                            self.log_auto_scroll = !self.log_auto_scroll;
-                            if self.log_auto_scroll && !self.log.is_empty() {
-                                self.log_pending_scroll = true;
-                                ui.ctx().request_repaint();
-                            }
+                            // When auto-scroll is off, still track offset for when it's re-enabled
+                            self.last_log_scroll_offset = Some(log_scroll_output.state.offset.y);
                         }
-                    });
-                    ui_left.separator();
-                    let log_scroll_output = egui::ScrollArea::vertical().stick_to_bottom(self.log_auto_scroll).auto_shrink([false; 2]).show(ui_left, |ui_left| {
-                        let mut line_rects: Vec<egui::Rect> = Vec::new();
-                        for line in &self.log {
-                            let resp = ui_left.label(line);
-                            line_rects.push(resp.rect);
-                        }
-                        ui_left.add_space(bottom_padding);
-
-                        // If a forced scroll was requested (new entries while auto-scroll enabled), scroll to the last line
-                        if self.log_pending_scroll {
-                            if let Some(last_rect) = line_rects.last() {
-                                ui_left.scroll_to_rect(*last_rect, Some(egui::Align::Max));
-                                ui_left.ctx().request_repaint();
-                            }
-                            self.log_pending_scroll = false;
-                        }
-                    });
-
-                    // Detect user manual scrolling (scrolling up) and disable auto-scroll
-                    if self.log_auto_scroll {
-                        let current_offset = log_scroll_output.state.offset.y;
-                        if let Some(last_offset) = self.last_log_scroll_offset {
-                            // If user scrolled up (offset decreased) and it's not due to pending scroll, disable auto-scroll
-                            if current_offset < last_offset - 1.0 {
-                                self.log_auto_scroll = false;
-                            }
-                        }
-                        self.last_log_scroll_offset = Some(current_offset);
-                    } else {
-                        // When auto-scroll is off, still track offset for when it's re-enabled
-                        self.last_log_scroll_offset = Some(log_scroll_output.state.offset.y);
-                    }
-                });
+                    },
+                );
 
                 // Handle (draggable)
-                let (handle_rect, handle_resp) = ui_row.allocate_exact_size(egui::vec2(handle_w, height), egui::Sense::drag());
+                let (handle_rect, handle_resp) =
+                    ui_row.allocate_exact_size(egui::vec2(handle_w, height), egui::Sense::drag());
 
                 // change cursor when hovering / dragging
                 if handle_resp.hovered() || handle_resp.dragged() {
-                    ui_row.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                    ui_row
+                        .ctx()
+                        .output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
                 }
 
                 if handle_resp.dragged() {
@@ -391,265 +488,374 @@ impl eframe::App for MidiApp {
                     let mid_x = handle_rect.center().x;
                     let top = handle_rect.top() + 8.0;
                     let bottom = handle_rect.bottom() - 8.0;
-                    handle_painter.line_segment([
-                        egui::pos2(mid_x, top),
-                        egui::pos2(mid_x, bottom),
-                    ], egui::Stroke::new(1.0, egui::Color32::from_gray(110)));
+                    handle_painter.line_segment(
+                        [egui::pos2(mid_x, top), egui::pos2(mid_x, bottom)],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                    );
                 }
 
                 // RIGHT PANE (Piano roll)
-                ui_row.allocate_ui_with_layout(egui::vec2(right_w, height), egui::Layout::top_down(egui::Align::Min), |ui_right| {
-                    ui_right.heading("Piano Roll");
-                    ui_right.separator();
+                ui_row.allocate_ui_with_layout(
+                    egui::vec2(right_w, height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui_right| {
+                        ui_right.heading("Piano Roll");
+                        ui_right.separator();
 
-                    let (r, _) = ui_right.allocate_exact_size(egui::vec2(right_w, height), egui::Sense::hover());
-                    let painter = ui_right.painter_at(r);
+                        let (r, _) = ui_right
+                            .allocate_exact_size(egui::vec2(right_w, height), egui::Sense::hover());
+                        let painter = ui_right.painter_at(r);
 
-                    // background
-                    painter.rect_filled(r, 0.0, egui::Color32::from_gray(30));
+                        // background
+                        painter.rect_filled(r, 0.0, egui::Color32::from_gray(30));
 
-                    let grid_left = r.left();
-                    let grid_right = r.right();
-                    let grid_top = r.top() + 20.0; // leave header space
-                    let grid_bottom = grid_top + row_h * 12.0;
+                        let grid_left = r.left();
+                        let grid_right = r.right();
+                        let grid_top = r.top() + 20.0; // leave header space
+                        let grid_bottom = grid_top + row_h * 12.0;
 
-                    // draw horizontal rows and labels (bottom to top C..B)
-                    let labels = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
-                    for row in 0..12 {
-                        let y = grid_bottom - (row as f32 + 1.0) * row_h;
+                        // draw horizontal rows and labels (bottom to top C..B)
+                        let labels = [
+                            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+                        ];
+                        for row in 0..12 {
+                            let y = grid_bottom - (row as f32 + 1.0) * row_h;
 
-                        // row background: darker for black keys, lighter for white keys
-                        let row_rect = egui::Rect::from_min_max(egui::pos2(grid_left, y), egui::pos2(grid_right, y + row_h));
-                        let is_black = matches!(row, 1 | 3 | 6 | 8 | 10);
-                        let bg = if is_black {
-                            egui::Color32::from_rgb(36, 40, 45) // darker
+                            // row background: darker for black keys, lighter for white keys
+                            let row_rect = egui::Rect::from_min_max(
+                                egui::pos2(grid_left, y),
+                                egui::pos2(grid_right, y + row_h),
+                            );
+                            let is_black = matches!(row, 1 | 3 | 6 | 8 | 10);
+                            let bg = if is_black {
+                                egui::Color32::from_rgb(36, 40, 45) // darker
+                            } else {
+                                egui::Color32::from_rgb(52, 56, 60) // lighter
+                            };
+                            painter.rect_filled(row_rect, 0.0, bg);
+
+                            // separator line
+                            painter.line_segment(
+                                [egui::pos2(grid_left, y), egui::pos2(grid_right, y)],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                            );
+
+                            // label on left
+                            let text_pos = egui::pos2(grid_left + 6.0, y + row_h * 0.18);
+                            painter.text(
+                                text_pos,
+                                egui::Align2::LEFT_TOP,
+                                labels[row as usize],
+                                egui::FontId::monospace(12.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+
+                        // draw vertical beat lines according to the current time signature (a/b)
+                        let now = Instant::now();
+                        let beats_per_measure: usize = self.time_sig_a as usize; // a
+                        let total_beats: usize = (self.measures as usize) * beats_per_measure;
+                        let window_beats = total_beats as f32;
+                        // BPM is always per quarter note: seconds per quarter
+                        let quarter_secs = 60.0_f32 / (self.tempo_bpm as f32);
+                        // seconds per beat unit (denominator b)
+                        let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                        let measure_secs = beat_secs * beats_per_measure as f32;
+                        let window_secs = measure_secs * (self.measures as f32);
+
+                        // Determine view_end: if scrolling is active compute normally, otherwise freeze to `frozen_view_end` (or now)
+                        let view_end = if self.scrolling_active {
+                            match self.scroll_mode {
+                                ScrollMode::Smooth => now,
+                                ScrollMode::Bar => {
+                                    if let Some(start) = self.start_time {
+                                        let elapsed = now.duration_since(start).as_secs_f32();
+                                        let measure_idx = (elapsed / measure_secs).floor();
+                                        start
+                                            + std::time::Duration::from_secs_f32(
+                                                (measure_idx + 1.0) * measure_secs,
+                                            )
+                                    } else {
+                                        // before the first note: keep a static window (no quantized jump)
+                                        now
+                                    }
+                                }
+                            }
                         } else {
-                            egui::Color32::from_rgb(52, 56, 60) // lighter
+                            self.frozen_view_end.unwrap_or(now)
                         };
-                        painter.rect_filled(row_rect, 0.0, bg);
 
-                        // separator line
-                        painter.line_segment([
-                            egui::pos2(grid_left, y),
-                            egui::pos2(grid_right, y),
-                        ], egui::Stroke::new(1.0, egui::Color32::from_gray(80)));
-
-                        // label on left
-                        let text_pos = egui::pos2(grid_left + 6.0, y + row_h * 0.18);
-                        painter.text(text_pos, egui::Align2::LEFT_TOP, labels[row as usize], egui::FontId::monospace(12.0), egui::Color32::WHITE);
-                    }
-
-                    // draw vertical beat lines according to the current time signature (a/b)
-                    let now = Instant::now();
-                    let beats_per_measure: usize = self.time_sig_a as usize; // a
-                    let total_beats: usize = (self.measures as usize) * beats_per_measure;
-                    let window_beats = total_beats as f32;
-                    // BPM is always per quarter note: seconds per quarter
-                    let quarter_secs = 60.0_f32 / (self.tempo_bpm as f32);
-                    // seconds per beat unit (denominator b)
-                    let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
-                    let measure_secs = beat_secs * beats_per_measure as f32;
-                    let window_secs = measure_secs * (self.measures as f32);
-
-                    // Determine view_end: if scrolling is active compute normally, otherwise freeze to `frozen_view_end` (or now)
-                    let view_end = if self.scrolling_active {
                         match self.scroll_mode {
-                            ScrollMode::Smooth => now,
+                            ScrollMode::Smooth => {
+                                if let Some(start) = self.start_time {
+                                    // Align beat lines to the global beat grid anchored at start_time and
+                                    // position them by their exact timestamp so they move smoothly.
+                                    let elapsed = view_end.duration_since(start).as_secs_f32();
+                                    let last_beat_idx = (elapsed / beat_secs).floor() as isize;
+                                    let first_beat_idx =
+                                        ((elapsed - window_secs) / beat_secs).floor() as isize;
+
+                                    for beat_idx in first_beat_idx..=last_beat_idx {
+                                        // beat_age = how long ago this beat occurred relative to view_end
+                                        let beat_age = elapsed - (beat_idx as f32) * beat_secs;
+                                        if beat_age < 0.0 || beat_age > window_secs {
+                                            continue;
+                                        }
+                                        let t = (1.0 - (beat_age / window_secs))
+                                            .clamp(0.0_f32, 1.0_f32);
+                                        let x = grid_left + t * (grid_right - grid_left);
+
+                                        let is_measure =
+                                            (beat_idx as isize) % (beats_per_measure as isize) == 0;
+                                        if is_measure {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    2.0,
+                                                    egui::Color32::from_rgb(180, 200, 255),
+                                                ),
+                                            );
+
+                                            // measure number relative to start_time (1-indexed)
+                                            let measure_num = (beat_idx as isize
+                                                / beats_per_measure as isize)
+                                                + 1;
+                                            painter.text(
+                                                egui::pos2(x + 4.0, grid_top - 16.0),
+                                                egui::Align2::LEFT_TOP,
+                                                format!("{}", measure_num),
+                                                egui::FontId::monospace(12.0),
+                                                egui::Color32::from_rgb(200, 220, 255),
+                                            );
+                                        } else {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(100),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // before the first note: static grid like Bar-mode fallback
+                                    for b in 0..=total_beats {
+                                        let x = grid_left
+                                            + (b as f32 / window_beats) * (grid_right - grid_left);
+                                        let is_measure = b % beats_per_measure == 0;
+                                        if is_measure {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    2.0,
+                                                    egui::Color32::from_rgb(180, 200, 255),
+                                                ),
+                                            );
+
+                                            let measure_num = b / beats_per_measure + 1;
+                                            painter.text(
+                                                egui::pos2(x + 4.0, grid_top - 16.0),
+                                                egui::Align2::LEFT_TOP,
+                                                format!("{}", measure_num),
+                                                egui::FontId::monospace(12.0),
+                                                egui::Color32::from_rgb(200, 220, 255),
+                                            );
+                                        } else {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(100),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             ScrollMode::Bar => {
                                 if let Some(start) = self.start_time {
-                                    let elapsed = now.duration_since(start).as_secs_f32();
-                                    let measure_idx = (elapsed / measure_secs).floor();
-                                    start + std::time::Duration::from_secs_f32((measure_idx + 1.0) * measure_secs)
+                                    // when started, quantize view_end and draw beat lines accordingly so the grid jumps per measure
+                                    let elapsed = view_end.duration_since(start).as_secs_f32();
+                                    let last_beat_idx = (elapsed / beat_secs).floor() as isize;
+                                    let first_beat_idx =
+                                        ((elapsed - window_secs) / beat_secs).floor() as isize;
+
+                                    for beat_idx in first_beat_idx..=last_beat_idx {
+                                        let beat_age = elapsed - (beat_idx as f32) * beat_secs;
+                                        if beat_age < 0.0 || beat_age > window_secs {
+                                            continue;
+                                        }
+                                        let t = (1.0 - (beat_age / window_secs))
+                                            .clamp(0.0_f32, 1.0_f32);
+                                        let x = grid_left + t * (grid_right - grid_left);
+
+                                        let is_measure =
+                                            (beat_idx as isize) % (beats_per_measure as isize) == 0;
+                                        if is_measure {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    2.0,
+                                                    egui::Color32::from_rgb(180, 200, 255),
+                                                ),
+                                            );
+
+                                            let measure_num = (beat_idx as isize
+                                                / beats_per_measure as isize)
+                                                + 1;
+                                            painter.text(
+                                                egui::pos2(x + 4.0, grid_top - 16.0),
+                                                egui::Align2::LEFT_TOP,
+                                                format!("{}", measure_num),
+                                                egui::FontId::monospace(12.0),
+                                                egui::Color32::from_rgb(200, 220, 255),
+                                            );
+                                        } else {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(100),
+                                                ),
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    // before the first note: keep a static window (no quantized jump)
-                                    now
-                                }
-                            }
-                        }
-                    } else {
-                        self.frozen_view_end.unwrap_or(now)
-                    };
+                                    // before the first note: static window grid
+                                    for b in 0..=total_beats {
+                                        let x = grid_left
+                                            + (b as f32 / window_beats) * (grid_right - grid_left);
+                                        let is_measure = b % beats_per_measure == 0;
+                                        if is_measure {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    2.0,
+                                                    egui::Color32::from_rgb(180, 200, 255),
+                                                ),
+                                            );
 
-                    match self.scroll_mode {
-                        ScrollMode::Smooth => {
-                            if let Some(start) = self.start_time {
-                                // Align beat lines to the global beat grid anchored at start_time and
-                                // position them by their exact timestamp so they move smoothly.
-                                let elapsed = view_end.duration_since(start).as_secs_f32();
-                                let last_beat_idx = (elapsed / beat_secs).floor() as isize;
-                                let first_beat_idx = ((elapsed - window_secs) / beat_secs).floor() as isize;
-
-                                for beat_idx in first_beat_idx..=last_beat_idx {
-                                    // beat_age = how long ago this beat occurred relative to view_end
-                                    let beat_age = elapsed - (beat_idx as f32) * beat_secs;
-                                    if beat_age < 0.0 || beat_age > window_secs { continue; }
-                                    let t = (1.0 - (beat_age / window_secs)).clamp(0.0_f32, 1.0_f32);
-                                    let x = grid_left + t * (grid_right - grid_left);
-
-                                    let is_measure = (beat_idx as isize) % (beats_per_measure as isize) == 0;
-                                    if is_measure {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 200, 255)));
-
-                                        // measure number relative to start_time (1-indexed)
-                                        let measure_num = (beat_idx as isize / beats_per_measure as isize) + 1;
-                                        painter.text(
-                                            egui::pos2(x + 4.0, grid_top - 16.0),
-                                            egui::Align2::LEFT_TOP,
-                                            format!("{}", measure_num),
-                                            egui::FontId::monospace(12.0),
-                                            egui::Color32::from_rgb(200, 220, 255),
-                                        );
-                                    } else {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(1.0, egui::Color32::from_gray(100)));
-                                    }
-                                }
-                            } else {
-                                // before the first note: static grid like Bar-mode fallback
-                                for b in 0..=total_beats {
-                                    let x = grid_left + (b as f32 / window_beats) * (grid_right - grid_left);
-                                    let is_measure = b % beats_per_measure == 0;
-                                    if is_measure {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 200, 255)));
-
-                                        let measure_num = b / beats_per_measure + 1;
-                                        painter.text(
-                                            egui::pos2(x + 4.0, grid_top - 16.0),
-                                            egui::Align2::LEFT_TOP,
-                                            format!("{}", measure_num),
-                                            egui::FontId::monospace(12.0),
-                                            egui::Color32::from_rgb(200, 220, 255),
-                                        );
-                                    } else {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(1.0, egui::Color32::from_gray(100)));
+                                            let measure_num = b / beats_per_measure + 1;
+                                            painter.text(
+                                                egui::pos2(x + 4.0, grid_top - 16.0),
+                                                egui::Align2::LEFT_TOP,
+                                                format!("{}", measure_num),
+                                                egui::FontId::monospace(12.0),
+                                                egui::Color32::from_rgb(200, 220, 255),
+                                            );
+                                        } else {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x, grid_top),
+                                                    egui::pos2(x, grid_bottom),
+                                                ],
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(100),
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                        ScrollMode::Bar => {
-                            if let Some(start) = self.start_time {
-                                // when started, quantize view_end and draw beat lines accordingly so the grid jumps per measure
-                                let elapsed = view_end.duration_since(start).as_secs_f32();
-                                let last_beat_idx = (elapsed / beat_secs).floor() as isize;
-                                let first_beat_idx = ((elapsed - window_secs) / beat_secs).floor() as isize;
 
-                                for beat_idx in first_beat_idx..=last_beat_idx {
-                                    let beat_age = elapsed - (beat_idx as f32) * beat_secs;
-                                    if beat_age < 0.0 || beat_age > window_secs { continue; }
-                                    let t = (1.0 - (beat_age / window_secs)).clamp(0.0_f32, 1.0_f32);
-                                    let x = grid_left + t * (grid_right - grid_left);
-
-                                    let is_measure = (beat_idx as isize) % (beats_per_measure as isize) == 0;
-                                    if is_measure {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 200, 255)));
-
-                                        let measure_num = (beat_idx as isize / beats_per_measure as isize) + 1;
-                                        painter.text(
-                                            egui::pos2(x + 4.0, grid_top - 16.0),
-                                            egui::Align2::LEFT_TOP,
-                                            format!("{}", measure_num),
-                                            egui::FontId::monospace(12.0),
-                                            egui::Color32::from_rgb(200, 220, 255),
-                                        );
-                                    } else {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(1.0, egui::Color32::from_gray(100)));
-                                    }
-                                }
-                            } else {
-                                // before the first note: static window grid
-                                for b in 0..=total_beats {
-                                    let x = grid_left + (b as f32 / window_beats) * (grid_right - grid_left);
-                                    let is_measure = b % beats_per_measure == 0;
-                                    if is_measure {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 200, 255)));
-
-                                        let measure_num = b / beats_per_measure + 1;
-                                        painter.text(
-                                            egui::pos2(x + 4.0, grid_top - 16.0),
-                                            egui::Align2::LEFT_TOP,
-                                            format!("{}", measure_num),
-                                            egui::FontId::monospace(12.0),
-                                            egui::Color32::from_rgb(200, 220, 255),
-                                        );
-                                    } else {
-                                        painter.line_segment([
-                                            egui::pos2(x, grid_top),
-                                            egui::pos2(x, grid_bottom),
-                                        ], egui::Stroke::new(1.0, egui::Color32::from_gray(100)));
-                                    }
-                                }
-                            }
+                        // chord generation per measure
+                        if let Some(start) = self.start_time {
+                            // Use actual current time (now) to determine which measures are active.
+                            // Using `view_end` (quantized in Bar mode) can cause an off-by-one where the view
+                            // is already snapped to the end of the first measure and we end up generating
+                            // both measure 1 and 2 at the same time. Using `now` avoids that.
+                            let elapsed = now.duration_since(start).as_secs_f32();
+                            // Convert to 1-based measure index so the first active measure is measure 1
+                            let current_measure_idx = (elapsed / measure_secs).floor() as u32 + 1;
+                            self.ensure_chords_up_to(current_measure_idx);
                         }
-                    }
 
-                    // chord generation per measure
-                    if let Some(start) = self.start_time {
-                        // Use actual current time (now) to determine which measures are active.
-                        // Using `view_end` (quantized in Bar mode) can cause an off-by-one where the view
-                        // is already snapped to the end of the first measure and we end up generating
-                        // both measure 1 and 2 at the same time. Using `now` avoids that.
-                        let elapsed = now.duration_since(start).as_secs_f32();
-                        // Convert to 1-based measure index so the first active measure is measure 1
-                        let current_measure_idx = (elapsed / measure_secs).floor() as u32 + 1;
-                        self.ensure_chords_up_to(current_measure_idx);
-                    }
+                        // cleanup old hits: keep if started or ended within window or if it's still active
+                        self.note_hits.retain(|h| {
+                            let start_in_window =
+                                view_end.duration_since(h.start).as_secs_f32() <= window_secs + 1.0;
+                            let end_in_window = h
+                                .end
+                                .map(|e| {
+                                    view_end.duration_since(e).as_secs_f32() <= window_secs + 1.0
+                                })
+                                .unwrap_or(false);
+                            start_in_window || end_in_window || h.end.is_none()
+                        });
 
-                    // cleanup old hits: keep if started or ended within window or if it's still active
-                    self.note_hits.retain(|h| {
-                        let start_in_window = view_end.duration_since(h.start).as_secs_f32() <= window_secs + 1.0;
-                        let end_in_window = h.end.map(|e| view_end.duration_since(e).as_secs_f32() <= window_secs + 1.0).unwrap_or(false);
-                        start_in_window || end_in_window || h.end.is_none()
-                    });
+                        // draw hits as rectangles spanning start..end (or start..view_end if active)
+                        for hit in &self.note_hits {
+                            // determine ages relative to view_end
+                            let start_age = view_end.duration_since(hit.start).as_secs_f32();
+                            let end_age = hit
+                                .end
+                                .map(|e| view_end.duration_since(e).as_secs_f32())
+                                .unwrap_or(0.0);
+                            // skip completely out-of-window elements
+                            if start_age > window_secs
+                                && hit
+                                    .end
+                                    .map(|e| view_end.duration_since(e).as_secs_f32())
+                                    .unwrap_or(0.0)
+                                    > window_secs
+                            {
+                                continue;
+                            }
 
-                    // draw hits as rectangles spanning start..end (or start..view_end if active)
-                    for hit in &self.note_hits {
-                        // determine ages relative to view_end
-                        let start_age = view_end.duration_since(hit.start).as_secs_f32();
-                        let end_age = hit.end.map(|e| view_end.duration_since(e).as_secs_f32()).unwrap_or(0.0);
-                        // skip completely out-of-window elements
-                        if start_age > window_secs && hit.end.map(|e| view_end.duration_since(e).as_secs_f32()).unwrap_or(0.0) > window_secs { continue; }
+                            // normalized positions in [0..1]
+                            let t_start = (1.0 - (start_age / window_secs)).clamp(0.0_f32, 1.0_f32);
+                            let t_end = (1.0 - (end_age / window_secs)).clamp(0.0_f32, 1.0_f32);
+                            let x_start = grid_left + t_start * (grid_right - grid_left);
+                            let x_end = grid_left + t_end * (grid_right - grid_left);
+                            let x0 = x_start.min(x_end);
+                            let x1 = x_start.max(x_end);
 
-                        // normalized positions in [0..1]
-                        let t_start = (1.0 - (start_age / window_secs)).clamp(0.0_f32, 1.0_f32);
-                        let t_end = (1.0 - (end_age / window_secs)).clamp(0.0_f32, 1.0_f32);
-                        let x_start = grid_left + t_start * (grid_right - grid_left);
-                        let x_end = grid_left + t_end * (grid_right - grid_left);
-                        let x0 = x_start.min(x_end);
-                        let x1 = x_start.max(x_end);
+                            let row = hit.pitch_class as usize;
+                            let y = grid_bottom - (row as f32 + 1.0) * row_h;
 
-                        let row = hit.pitch_class as usize;
-                        let y = grid_bottom - (row as f32 + 1.0) * row_h;
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(x0, y + 2.0),
+                                egui::pos2(x1.max(x0 + 4.0), y + row_h - 2.0),
+                            );
 
-                        let rect = egui::Rect::from_min_max(egui::pos2(x0, y + 2.0), egui::pos2(x1.max(x0 + 4.0), y + row_h - 2.0));
+                            // alpha fades based on end age (active notes show fully opaque)
+                            let age_ref = end_age;
+                            let alpha = ((1.0 - (age_ref / window_secs)).clamp(0.0_f32, 1.0_f32)
+                                * 220.0) as u8;
+                            let col = egui::Color32::from_rgba_premultiplied(
+                                (80 + hit.velocity) as u8,
+                                200,
+                                80,
+                                alpha,
+                            );
 
-                        // alpha fades based on end age (active notes show fully opaque)
-                        let age_ref = end_age;
-                        let alpha = ((1.0 - (age_ref / window_secs)).clamp(0.0_f32, 1.0_f32) * 220.0) as u8;
-                        let col = egui::Color32::from_rgba_premultiplied((80 + hit.velocity) as u8, 200, 80, alpha);
-
-                        painter.rect_filled(rect, 2.0, col);
-                    }
-                });
+                            painter.rect_filled(rect, 2.0, col);
+                        }
+                    },
+                );
             }); // end ui.horizontal
 
             // If there are active or recent hits, request periodic repaints for animation
@@ -661,10 +867,34 @@ impl eframe::App for MidiApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.heading("Chord");
-                // push the toggle to the right but keep it inside the available area
+                // place the algorithm selector immediately to the right of the title
+                ui.add_space(8.0);
+
+                ui.label("Algorithm:");
+                let selected_text = self
+                    .selected_algo_idx
+                    .and_then(|idx| self.algos.get(idx).and_then(|a| a.file_stem()))
+                    .unwrap_or("(none)".to_string());
+
+                egui::ComboBox::from_label("")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_algo_idx, None, "(none)");
+                        for (i, algo) in self.algos.iter().enumerate() {
+                            let name = algo.file_stem().unwrap_or_else(|| algo.name.clone());
+                            ui.selectable_value(&mut self.selected_algo_idx, Some(i), name);
+                        }
+                    });
+
+                if ui.button("Refresh").clicked() {
+                    self.refresh_algos();
+                }
+
+                // push the auto-scroll toggle to the far right of the header, leaving a small right margin
                 let sz: f32 = 26.0;
-                let rem = ui.available_width();
-                let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
+                let rem_after = ui.available_width();
+                let right_margin: f32 = 12.0; // px of spacing to keep from the right edge
+                let push = (rem_after - (sz + right_margin)).max(0.0);
                 ui.add_space(push);
 
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
@@ -678,7 +908,13 @@ impl eframe::App for MidiApp {
                 };
                 painter.rect_filled(rect, 4.0, bg);
                 // icon
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, "🔁", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "🔁",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::WHITE,
+                );
 
                 if resp.clicked() {
                     self.chords_auto_scroll = !self.chords_auto_scroll;
@@ -690,25 +926,47 @@ impl eframe::App for MidiApp {
             });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            let chord_scroll_output = egui::ScrollArea::horizontal().stick_to_right(self.chords_auto_scroll).max_height(card_h + 16.0).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let mut card_rects: Vec<egui::Rect> = Vec::new();
-                    for (_i, (measure, chord)) in self.chords.iter().enumerate() {
-                        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::hover());
-                        let painter = ui.painter_at(rect);
-                        painter.rect_filled(rect.shrink(4.0), 6.0, egui::Color32::from_rgb(60, 60, 70));
-                        painter.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{}.", measure), egui::FontId::monospace(10.0), egui::Color32::from_gray(200));
-                        painter.text(rect.center(), egui::Align2::CENTER_CENTER, chord, egui::FontId::proportional(18.0), egui::Color32::WHITE);
-                        card_rects.push(rect);
-                    }
-                    if let Some(idx) = self.chord_pending_scroll_index.take() {
-                        if idx < card_rects.len() {
-                            ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                            ui.ctx().request_repaint();
+            let chord_scroll_output = egui::ScrollArea::horizontal()
+                .stick_to_right(self.chords_auto_scroll)
+                .max_height(card_h + 16.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut card_rects: Vec<egui::Rect> = Vec::new();
+                        for (_i, (measure, chord)) in self.chords.iter().enumerate() {
+                            let (rect, _resp) = ui.allocate_exact_size(
+                                egui::vec2(card_w, card_h),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(
+                                rect.shrink(4.0),
+                                6.0,
+                                egui::Color32::from_rgb(60, 60, 70),
+                            );
+                            painter.text(
+                                rect.left_top() + egui::vec2(8.0, 6.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{}.", measure),
+                                egui::FontId::monospace(10.0),
+                                egui::Color32::from_gray(200),
+                            );
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                chord,
+                                egui::FontId::proportional(18.0),
+                                egui::Color32::WHITE,
+                            );
+                            card_rects.push(rect);
                         }
-                    }
+                        if let Some(idx) = self.chord_pending_scroll_index.take() {
+                            if idx < card_rects.len() {
+                                ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    });
                 });
-            });
 
             // Detect user manual scrolling (scrolling left) and disable auto-scroll
             if self.chords_auto_scroll {

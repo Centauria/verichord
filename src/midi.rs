@@ -1,3 +1,4 @@
+use crate::algo_load::SampleNextChordFn;
 use std::time::Instant;
 
 /// Pitch-class note representation and sustain tracking
@@ -28,12 +29,19 @@ pub fn parse_note_action(bytes: &[u8], ts: Instant) -> Option<NoteAction> {
             0x90 => {
                 let pc = data1 % 12;
                 if data2 != 0 {
-                    Some(NoteAction::On { pc, vel: data2, time: ts })
+                    Some(NoteAction::On {
+                        pc,
+                        vel: data2,
+                        time: ts,
+                    })
                 } else {
                     Some(NoteAction::Off { pc, time: ts })
                 }
             }
-            0x80 => Some(NoteAction::Off { pc: data1 % 12, time: ts }),
+            0x80 => Some(NoteAction::Off {
+                pc: data1 % 12,
+                time: ts,
+            }),
             _ => None,
         }
     } else {
@@ -41,8 +49,18 @@ pub fn parse_note_action(bytes: &[u8], ts: Instant) -> Option<NoteAction> {
     }
 }
 
-pub fn generate_chord_for_measure(_measure_idx: u32) -> String {
-    // Placeholder: always return No Chord
+pub fn generate_chord_for_measure(
+    measure_idx: u32,
+    sample_fn: Option<SampleNextChordFn>,
+) -> String {
+    // If a sample function is provided, call it and use its numeric result as the chord representation.
+    // Note: the external function is declared as `uint32_t sample_next_chord(uint32_t input);`.
+    // Here we simply format the returned u32 as a decimal string. Adjust the interpretation
+    // (e.g. bitmask -> pitch classes or a lookup table) according to your plugin's contract.
+    if let Some(func) = sample_fn {
+        let out = unsafe { func(measure_idx) };
+        return format!("{}", out);
+    }
+    // Fallback if no plugin is selected or the selected library doesn't export the symbol.
     "N.C.".to_string()
 }
-
