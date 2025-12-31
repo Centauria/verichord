@@ -1,4 +1,5 @@
 use crate::algo_load::SampleNextChordFn;
+use crate::chord::PitchOrderedSet;
 use std::time::Instant;
 
 /// Pitch-class note representation and sustain tracking
@@ -50,17 +51,16 @@ pub fn parse_note_action(bytes: &[u8], ts: Instant) -> Option<NoteAction> {
 }
 
 pub fn generate_chord_for_measure(
-    measure_idx: u32,
+    last_chord: PitchOrderedSet,
     sample_fn: Option<SampleNextChordFn>,
-) -> String {
+) -> PitchOrderedSet {
     // If a sample function is provided, call it and use its numeric result as the chord representation.
-    // Note: the external function is declared as `uint32_t sample_next_chord(uint32_t input);`.
-    // Here we simply format the returned u32 as a decimal string. Adjust the interpretation
-    // (e.g. bitmask -> pitch classes or a lookup table) according to your plugin's contract.
+    // The plugin is expected to return the packed `u32` representation compatible with `PitchOrderedSet`.
+    // We pass the previous chord's packed `u32` data as the input parameter to the plugin.
     if let Some(func) = sample_fn {
-        let out = unsafe { func(measure_idx) };
-        return format!("{}", out);
+        let out = unsafe { func(last_chord.get_data()) };
+        return PitchOrderedSet::from_data(out);
     }
     // Fallback if no plugin is selected or the selected library doesn't export the symbol.
-    "N.C.".to_string()
+    PitchOrderedSet::new()
 }

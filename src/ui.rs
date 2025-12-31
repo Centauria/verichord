@@ -5,7 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use wmidi::MidiMessage;
 
+use crate::chord::chord::chord::MAJ;
+use crate::chord::chord::{Pitch};
 use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
+use crate::chord::PitchOrderedSet;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum ScrollMode {
@@ -28,7 +31,7 @@ pub struct MidiApp {
     start_time: Option<Instant>,
     measures: u32,
     log_width_frac: f32,
-    chords: Vec<(u32, String)>,
+    chords: Vec<(u32, PitchOrderedSet)>,
     chords_auto_scroll: bool,
     chord_pending_scroll_index: Option<usize>,
     scrolling_active: bool,
@@ -68,7 +71,7 @@ impl Default for MidiApp {
             start_time: None,
             measures: 2,
             log_width_frac: 0.35_f32,
-            chords: vec![(0, "N.C.".to_string())],
+            chords: vec![(0, PitchOrderedSet::from_intervals(Pitch::C, MAJ))],
             chords_auto_scroll: true,
             chord_pending_scroll_index: None,
             scrolling_active: false,
@@ -166,7 +169,7 @@ impl MidiApp {
                     self.log.clear();
                     self.note_hits.clear();
                     self.chords.clear();
-                    self.chords.push((0, "N.C.".to_string()));
+                    self.chords.push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
                     self.chord_pending_scroll_index = None;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
@@ -226,7 +229,7 @@ impl MidiApp {
                             self.scrolling_active = true;
                             self.frozen_view_end = None;
                             self.chords.clear();
-                            self.chords.push((0, "N.C.".to_string()));
+                            self.chords.push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
                         }
                         self.note_hits.push(NoteHit {
                             pitch_class: pc,
@@ -268,10 +271,19 @@ impl MidiApp {
     fn ensure_chords_up_to(&mut self, up_to: u32) {
         let mut next = self.chords.last().map(|(m, _)| m + 1).unwrap_or(0);
         while next <= up_to {
-            let sample_fn = self
-                .selected_algo_idx
-                .and_then(|idx| self.algos.get(idx).and_then(|a| a.sample_next_chord_fn()));
-            let chord = generate_chord_for_measure(next, sample_fn);
+            // Prefer the explicit capability check so we don't rely only on raw fn pointers.
+            // This also makes use of `has_sample_next_chord()` so the helper is exercised.
+            let sample_fn = self.selected_algo_idx.and_then(|idx| {
+                self.algos.get(idx).and_then(|a| {
+                    if a.has_sample_next_chord() {
+                        a.sample_next_chord_fn()
+                    } else {
+                        None
+                    }
+                })
+            });
+            let last_chord = self.chords.last().map(|(_, c)| *c).unwrap_or(PitchOrderedSet::new());
+            let chord = generate_chord_for_measure(last_chord, sample_fn);
             self.chords.push((next, chord));
             if self.chords_auto_scroll {
                 self.chord_pending_scroll_index = Some(self.chords.len() - 1);
@@ -953,7 +965,7 @@ impl eframe::App for MidiApp {
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                chord,
+                                chord.to_string(),
                                 egui::FontId::proportional(18.0),
                                 egui::Color32::WHITE,
                             );

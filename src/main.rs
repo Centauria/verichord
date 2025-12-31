@@ -1,5 +1,6 @@
 mod algo_load;
 mod midi;
+mod chord;
 mod ui;
 
 fn main() {
