@@ -238,16 +238,19 @@ impl PitchOrderedSet {
     }
 
     pub fn to_string(&self) -> String {
-        if let Some((name, _base)) = crate::chord::get_chord_info(self.chordbase()) {
+        let chordbase = self.chordbase();
+        if let Some((name, base)) = crate::chord::get_chord_info(chordbase) {
             let root = PITCH_NAMES[self.root() as usize];
-            let base = self.base();
-            if base == 1 {
+            if base == 0 {
                 format!("{}{}", root, name)
             } else {
-                let base_name = PITCH_NAMES[(self.root() + base.trailing_zeros()) as usize % DIV];
+                let base_name = PITCH_NAMES[(self.root() + base) as usize % DIV];
                 format!("{}{}/{}", root, name, base_name)
             }
         } else {
+            if chordbase == 0 {
+                return "N.C.".to_string();
+            }
             let detail = format!("{:032b}", self.data);
             let chord_bits = &detail[20..32];
             let base_bits = &detail[8..20];
