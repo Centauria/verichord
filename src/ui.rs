@@ -5,10 +5,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use wmidi::MidiMessage;
 
-use crate::chord::chord::chord::MAJ;
-use crate::chord::chord::{Pitch};
-use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 use crate::chord::PitchOrderedSet;
+use crate::chord::chord::Pitch;
+use crate::chord::chord::chord::MAJ;
+use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum ScrollMode {
@@ -49,6 +49,7 @@ pub struct MidiApp {
     algos: Vec<crate::algo_load::AlgoLib>,
     // index into `algos` for the selected algorithm (None == no plugin selected)
     selected_algo_idx: Option<usize>,
+    power_save_mode: bool,
 }
 
 impl Default for MidiApp {
@@ -85,6 +86,7 @@ impl Default for MidiApp {
             last_chord_scroll_offset: None,
             algos: Vec::new(),
             selected_algo_idx: None,
+            power_save_mode: false,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -169,7 +171,8 @@ impl MidiApp {
                     self.log.clear();
                     self.note_hits.clear();
                     self.chords.clear();
-                    self.chords.push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
+                    self.chords
+                        .push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
                     self.chord_pending_scroll_index = None;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
@@ -229,7 +232,8 @@ impl MidiApp {
                             self.scrolling_active = true;
                             self.frozen_view_end = None;
                             self.chords.clear();
-                            self.chords.push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
+                            self.chords
+                                .push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
                         }
                         self.note_hits.push(NoteHit {
                             pitch_class: pc,
@@ -282,8 +286,17 @@ impl MidiApp {
                     }
                 })
             });
-            let last_chord = self.chords.last().map(|(_, c)| *c).unwrap_or(PitchOrderedSet::new());
+            let last_chord = self
+                .chords
+                .last()
+                .map(|(_, c)| *c)
+                .unwrap_or(PitchOrderedSet::new());
             let chord = generate_chord_for_measure(last_chord, sample_fn);
+            println!(
+                "Generated chord for measure {}: {:032b}",
+                next,
+                chord.get_data()
+            );
             self.chords.push((next, chord));
             if self.chords_auto_scroll {
                 self.chord_pending_scroll_index = Some(self.chords.len() - 1);
@@ -344,6 +357,10 @@ impl eframe::App for MidiApp {
                             }
                         }
                     });
+
+                    ui.checkbox(&mut self.power_save_mode, "Power Save Mode")
+                        .on_hover_text("When enabled, pause repaint when no notes are active to save CPU (default: off).");
+
                 });
             });
 
@@ -870,8 +887,8 @@ impl eframe::App for MidiApp {
                 );
             }); // end ui.horizontal
 
-            // If there are active or recent hits, request periodic repaints for animation
-            if !self.note_hits.is_empty() {
+            // Request periodic repaints for animation. When Power Save Mode is enabled, only repaint when there are active or recent hits.
+            if !self.power_save_mode || !self.note_hits.is_empty() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(40));
             }
 
