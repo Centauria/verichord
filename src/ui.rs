@@ -2,13 +2,26 @@ use chrono::Local;
 use eframe::{egui, egui::ComboBox};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wmidi::MidiMessage;
 
 use crate::chord::PitchOrderedSet;
 use crate::chord::chord::Pitch;
 use crate::chord::chord::chord::MAJ;
 use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
+
+fn format_duration_adaptive(d: Duration) -> String {
+    let ns = d.as_nanos() as f64;
+    if ns >= 1_000_000_000.0 {
+        format!("{:.3} s", ns / 1e9)
+    } else if ns >= 1_000_000.0 {
+        format!("{:.3} ms", ns / 1e6)
+    } else if ns >= 1_000.0 {
+        format!("{:.3} us", ns / 1e3)
+    } else {
+        format!("{} ns", d.as_nanos())
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum ScrollMode {
@@ -31,7 +44,7 @@ pub struct MidiApp {
     start_time: Option<Instant>,
     measures: u32,
     log_width_frac: f32,
-    chords: Vec<(u32, PitchOrderedSet)>,
+    chords: Vec<(u32, PitchOrderedSet, Duration)>,
     chords_auto_scroll: bool,
     chord_pending_scroll_index: Option<usize>,
     scrolling_active: bool,
@@ -72,7 +85,11 @@ impl Default for MidiApp {
             start_time: None,
             measures: 2,
             log_width_frac: 0.35_f32,
-            chords: vec![(0, PitchOrderedSet::from_intervals(Pitch::C, MAJ))],
+            chords: vec![(
+                0,
+                PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                std::time::Duration::ZERO,
+            )],
             chords_auto_scroll: true,
             chord_pending_scroll_index: None,
             scrolling_active: false,
@@ -171,8 +188,11 @@ impl MidiApp {
                     self.log.clear();
                     self.note_hits.clear();
                     self.chords.clear();
-                    self.chords
-                        .push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
+                    self.chords.push((
+                        0,
+                        PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                        std::time::Duration::ZERO,
+                    ));
                     self.chord_pending_scroll_index = None;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
@@ -232,8 +252,11 @@ impl MidiApp {
                             self.scrolling_active = true;
                             self.frozen_view_end = None;
                             self.chords.clear();
-                            self.chords
-                                .push((0, PitchOrderedSet::from_intervals(Pitch::C, MAJ)));
+                            self.chords.push((
+                                0,
+                                PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                                std::time::Duration::ZERO,
+                            ));
                         }
                         self.note_hits.push(NoteHit {
                             pitch_class: pc,
@@ -273,7 +296,7 @@ impl MidiApp {
     }
 
     fn ensure_chords_up_to(&mut self, up_to: u32) {
-        let mut next = self.chords.last().map(|(m, _)| m + 1).unwrap_or(0);
+        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(0);
         while next <= up_to {
             // Prefer the explicit capability check so we don't rely only on raw fn pointers.
             // This also makes use of `has_sample_next_chord()` so the helper is exercised.
@@ -289,15 +312,18 @@ impl MidiApp {
             let last_chord = self
                 .chords
                 .last()
-                .map(|(_, c)| *c)
+                .map(|(_, c, _)| *c)
                 .unwrap_or(PitchOrderedSet::new());
+            let start = Instant::now();
             let chord = generate_chord_for_measure(last_chord, sample_fn);
+            let elapsed = start.elapsed();
             println!(
-                "Generated chord for measure {}: {:032b}",
+                "Generated chord for measure {}:\t{:032b} [{} ns]",
                 next,
-                chord.get_data()
+                chord.get_data(),
+                elapsed.as_nanos()
             );
-            self.chords.push((next, chord));
+            self.chords.push((next, chord, elapsed));
             if self.chords_auto_scroll {
                 self.chord_pending_scroll_index = Some(self.chords.len() - 1);
             }
@@ -961,7 +987,7 @@ impl eframe::App for MidiApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let mut card_rects: Vec<egui::Rect> = Vec::new();
-                        for (_i, (measure, chord)) in self.chords.iter().enumerate() {
+                        for (_i, (measure, chord, dur)) in self.chords.iter().enumerate() {
                             let (rect, _resp) = ui.allocate_exact_size(
                                 egui::vec2(card_w, card_h),
                                 egui::Sense::hover(),
@@ -985,6 +1011,14 @@ impl eframe::App for MidiApp {
                                 chord.to_string(),
                                 egui::FontId::proportional(18.0),
                                 egui::Color32::WHITE,
+                            );
+                            // Draw the measured duration in bottom-right with adaptive units
+                            painter.text(
+                                rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                egui::Align2::RIGHT_BOTTOM,
+                                format_duration_adaptive(*dur),
+                                egui::FontId::monospace(10.0),
+                                egui::Color32::from_gray(180),
                             );
                             card_rects.push(rect);
                         }
