@@ -1,6 +1,11 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod algo_load;
-mod midi;
 mod chord;
+mod midi;
 mod ui;
 
 fn main() {
