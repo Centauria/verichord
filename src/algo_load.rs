@@ -88,6 +88,7 @@ impl AlgoLib {
     }
 
     /// Call `sample_next_chord`. Returns `Some(result)` if available, otherwise `None`.
+    #[allow(dead_code)]
     pub fn sample_next_chord(&self, input: u32) -> Option<u32> {
         self.sample_next_chord.map(|f| unsafe { f(input) })
     }

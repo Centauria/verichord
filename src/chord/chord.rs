@@ -279,7 +279,7 @@ impl PitchOrderedSet {
     }
 
     pub fn root(&self) -> u32 {
-        (self.data >> (DIV * 2)) & 0xF
+        shift(self.data)
     }
 
     pub fn set_note(&mut self, note: Pitch) -> &mut Self {
