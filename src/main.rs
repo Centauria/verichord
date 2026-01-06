@@ -6,6 +6,7 @@
 mod algo_load;
 mod chord;
 mod midi;
+mod rhythm;
 mod ui;
 
 fn main() {

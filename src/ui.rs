@@ -618,6 +618,18 @@ impl eframe::App for MidiApp {
                         let measure_secs = beat_secs * beats_per_measure as f32;
                         let window_secs = measure_secs * (self.measures as f32);
 
+                        // Map time signature to hierarchical beats for rhythm weighting.
+                        // Special-case common compound time 6/8 -> [2,3], otherwise use top-level beats = a
+                        let beats_vec: Vec<i32> = if self.time_sig_a == 4 {
+                            vec![2, 2]
+                        } else if self.time_sig_a == 9 {
+                            vec![3, 3]
+                        } else if self.time_sig_a == 6 && self.time_sig_b == 8 {
+                            vec![2, 3]
+                        } else {
+                            vec![beats_per_measure as i32]
+                        };
+
                         // Determine view_end: if scrolling is active compute normally, otherwise freeze to `frozen_view_end` (or now)
                         let view_end = if self.scrolling_active {
                             match self.scroll_mode {
@@ -908,6 +920,63 @@ impl eframe::App for MidiApp {
                             );
 
                             painter.rect_filled(rect, 2.0, col);
+
+                            // Compute rhythm weight in-measure and draw it at the left edge of the note.
+                            if let Some(start_anchor) = self.start_time {
+                                // start position within its measure
+                                let s_elapsed =
+                                    hit.start.duration_since(start_anchor).as_secs_f32();
+                                let s_measure_idx = (s_elapsed / measure_secs).floor() as i64;
+                                let s_in_measure = ((s_elapsed
+                                    - (s_measure_idx as f32) * measure_secs)
+                                    / measure_secs)
+                                    .clamp(0.0_f32, 1.0_f32);
+
+                                // end position: either explicit end, or current time's in-measure position
+                                let (e_in_measure, e_measure_idx) = if let Some(e) = hit.end {
+                                    let e_elapsed = e.duration_since(start_anchor).as_secs_f32();
+                                    let e_measure_idx = (e_elapsed / measure_secs).floor() as i64;
+                                    let e_in_measure = ((e_elapsed
+                                        - (e_measure_idx as f32) * measure_secs)
+                                        / measure_secs)
+                                        .clamp(0.0_f32, 1.0_f32);
+                                    (e_in_measure, e_measure_idx)
+                                } else {
+                                    let now_elapsed =
+                                        now.duration_since(start_anchor).as_secs_f32();
+                                    let now_measure_idx =
+                                        (now_elapsed / measure_secs).floor() as i64;
+                                    let now_in_measure = ((now_elapsed
+                                        - (now_measure_idx as f32) * measure_secs)
+                                        / measure_secs)
+                                        .clamp(0.0_f32, 1.0_f32);
+                                    (now_in_measure, now_measure_idx)
+                                };
+
+                                let a = s_in_measure as f64;
+                                let b = if e_measure_idx != s_measure_idx {
+                                    1.0
+                                } else {
+                                    e_in_measure as f64
+                                };
+
+                                let weight = if b > a {
+                                    crate::rhythm::weight::rhythm_weight(a, b, &beats_vec)
+                                } else {
+                                    0.0
+                                };
+
+                                // Draw weight text at the left side with fully transparent background
+                                let label = format!("{:.3}", weight);
+                                let label_pos = egui::pos2(x0 + 4.0, y + 4.0);
+                                painter.text(
+                                    label_pos,
+                                    egui::Align2::LEFT_TOP,
+                                    label,
+                                    egui::FontId::monospace(12.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
                         }
                     },
                 );
