@@ -53,12 +53,17 @@ pub fn parse_note_action(bytes: &[u8], ts: Instant) -> Option<NoteAction> {
 pub fn generate_chord_for_measure(
     last_chord: PitchOrderedSet,
     sample_fn: Option<SampleNextChordFn>,
+    notes: &[crate::algo_load::NoteData],
 ) -> PitchOrderedSet {
     // If a sample function is provided, call it and use its numeric result as the chord representation.
     // The plugin is expected to return the packed `u32` representation compatible with `PitchOrderedSet`.
-    // We pass the previous chord's packed `u32` data as the input parameter to the plugin.
     if let Some(func) = sample_fn {
-        let out = unsafe { func(last_chord.get_data()) };
+        let ptr = if notes.is_empty() {
+            std::ptr::null()
+        } else {
+            notes.as_ptr()
+        };
+        let out = unsafe { func(last_chord.get_data(), ptr, notes.len()) };
         return PitchOrderedSet::from_data(out);
     }
     // Fallback if no plugin is selected or the selected library doesn't export the symbol.

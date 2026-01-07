@@ -86,7 +86,7 @@ impl Default for MidiApp {
             measures: 2,
             log_width_frac: 0.35_f32,
             chords: vec![(
-                0,
+                1,
                 PitchOrderedSet::from_intervals(Pitch::C, MAJ),
                 std::time::Duration::ZERO,
             )],
@@ -189,7 +189,7 @@ impl MidiApp {
                     self.note_hits.clear();
                     self.chords.clear();
                     self.chords.push((
-                        0,
+                        1,
                         PitchOrderedSet::from_intervals(Pitch::C, MAJ),
                         std::time::Duration::ZERO,
                     ));
@@ -253,7 +253,7 @@ impl MidiApp {
                             self.frozen_view_end = None;
                             self.chords.clear();
                             self.chords.push((
-                                0,
+                                1,
                                 PitchOrderedSet::from_intervals(Pitch::C, MAJ),
                                 std::time::Duration::ZERO,
                             ));
@@ -296,7 +296,10 @@ impl MidiApp {
     }
 
     fn ensure_chords_up_to(&mut self, up_to: u32) {
-        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(0);
+        // `self.chords` stores predicted chords per measure (1-based).
+        // The initial chord is treated as measure 1. At the end of measure n,
+        // we summarize notes in measure n and generate the chord for measure n+1.
+        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(2);
         while next <= up_to {
             // Prefer the explicit capability check so we don't rely only on raw fn pointers.
             // This also makes use of `has_sample_next_chord()` so the helper is exercised.
@@ -315,7 +318,81 @@ impl MidiApp {
                 .map(|(_, c, _)| *c)
                 .unwrap_or(PitchOrderedSet::new());
             let start = Instant::now();
-            let chord = generate_chord_for_measure(last_chord, sample_fn);
+            // Build normalized NoteData for the *previous* measure (`next - 1`).
+            let notes_for_measure: Vec<crate::algo_load::NoteData> = {
+                let mut notes = Vec::new();
+                if let Some(st) = self.start_time {
+                    let beat_secs = 60.0 / (self.tempo_bpm as f32);
+                    let beats_per_measure: usize = self.time_sig_a as usize;
+                    let measure_secs = beat_secs * beats_per_measure as f32;
+                    // We are predicting chord for measure `next` using notes from measure `src_measure`.
+                    // Measures are 1-based: measure 1 starts at t=0.
+                    let src_measure = next - 1;
+                    let src_idx0 = (src_measure - 1) as f32;
+                    let measure_start = src_idx0 * measure_secs;
+                    let measure_end = (src_idx0 + 1.0) * measure_secs;
+
+                    for hit in &self.note_hits {
+                        let s_elapsed = (hit.start - st).as_secs_f32();
+
+                        // Exclude if note starts at/after measure end.
+                        if s_elapsed >= measure_end {
+                            continue;
+                        }
+
+                        // Exclude if note ends at/before measure start.
+                        if let Some(e) = hit.end {
+                            let e_elapsed = (e - st).as_secs_f32();
+                            if e_elapsed <= measure_start {
+                                continue;
+                            }
+                        }
+
+                        // Normalize start/end within the source measure.
+                        // Notes started in a previous measure => start=0.0.
+                        let s_norm = if s_elapsed <= measure_start {
+                            0.0
+                        } else {
+                            ((s_elapsed - measure_start) / measure_secs).clamp(0.0, 1.0)
+                        };
+
+                        // Notes still active at the measure boundary => end=1.0.
+                        let e_norm = match hit.end {
+                            Some(e) => {
+                                let e_elapsed = (e - st).as_secs_f32();
+                                if e_elapsed >= measure_end {
+                                    1.0
+                                } else {
+                                    ((e_elapsed - measure_start) / measure_secs).clamp(0.0, 1.0)
+                                }
+                            }
+                            None => 1.0,
+                        };
+
+                        // Normalize velocity to [0,1] (MIDI velocities are 0..127)
+                        let v_norm = (hit.velocity as f32) / 127.0;
+
+                        notes.push(crate::algo_load::NoteData {
+                            pitch: hit.pitch as i32,
+                            start: s_norm,
+                            end: e_norm,
+                            velocity: v_norm,
+                        });
+                    }
+                }
+                notes
+            };
+            for note in &notes_for_measure {
+                println!(
+                    "Note in measure {}: pitch={} start={:.3} end={:.3} vel={:.3}",
+                    next - 1,
+                    note.pitch,
+                    note.start,
+                    note.end,
+                    note.velocity
+                );
+            }
+            let chord = generate_chord_for_measure(last_chord, sample_fn, &notes_for_measure);
             let elapsed = start.elapsed();
             println!(
                 "Generated chord for measure {}:\t{:032b} [{} ns]",

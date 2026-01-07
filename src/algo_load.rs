@@ -26,8 +26,28 @@ use std::{
 
 use libloading::Library;
 
-/// C function signature: uint32_t sample_next_chord(uint32_t input);
-pub type SampleNextChordFn = unsafe extern "C" fn(u32) -> u32;
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count);
+///
+/// The `NoteData` structure (C layout):
+/// ```c
+/// struct NoteData {
+///     int pitch;
+///     float start;   // normalized to [0,1] within the measure
+///     float end;     // normalized to [0,1] within the measure
+///     float velocity;// normalized to [0,1]
+/// };
+/// ```
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct NoteData {
+    pub pitch: i32,
+    pub start: f32,
+    pub end: f32,
+    pub velocity: f32,
+}
+
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count);
+pub type SampleNextChordFn = unsafe extern "C" fn(u32, *const NoteData, usize) -> u32;
 
 /// Represents a loaded algorithm library. Keeps the `Library` handle alive
 /// to ensure any obtained function pointers remain valid while the struct lives.
@@ -87,10 +107,16 @@ impl AlgoLib {
         self.sample_next_chord
     }
 
-    /// Call `sample_next_chord`. Returns `Some(result)` if available, otherwise `None`.
+    /// Call `sample_next_chord` with normalized note data. Returns `Some(result)` if available.
     #[allow(dead_code)]
-    pub fn sample_next_chord(&self, input: u32) -> Option<u32> {
-        self.sample_next_chord.map(|f| unsafe { f(input) })
+    pub fn sample_next_chord(&self, input: u32, notes: &[NoteData]) -> Option<u32> {
+        let ptr = if notes.is_empty() {
+            std::ptr::null()
+        } else {
+            notes.as_ptr()
+        };
+        self.sample_next_chord
+            .map(|f| unsafe { f(input, ptr, notes.len()) })
     }
 
     /// Return the filename without extension (file stem) if available.
