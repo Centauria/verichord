@@ -621,7 +621,7 @@ impl eframe::App for MidiApp {
                         // Map time signature to hierarchical beats for rhythm weighting.
                         // Special-case common compound time 6/8 -> [2,3], otherwise use top-level beats = a
                         let beats_vec: Vec<i32> = if self.time_sig_a == 4 {
-                            vec![2, 2]
+                            vec![2, 2, 2]
                         } else if self.time_sig_a == 9 {
                             vec![3, 3]
                         } else if self.time_sig_a == 6 && self.time_sig_b == 8 {
