@@ -109,7 +109,7 @@ impl Default for MidiApp {
             algos: Vec::new(),
             selected_algo_idx: None,
             power_save_mode: false,
-            metronome_enabled: false,
+            metronome_enabled: true,
             metronome: None,
         };
         app.midi_in.ignore(Ignore::None);
