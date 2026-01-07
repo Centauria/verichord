@@ -2,10 +2,10 @@ use crate::algo_load::SampleNextChordFn;
 use crate::chord::PitchOrderedSet;
 use std::time::Instant;
 
-/// Pitch-class note representation and sustain tracking
+/// Raw pitch note representation and sustain tracking
 #[derive(Clone, Debug)]
 pub struct NoteHit {
-    pub pitch_class: u8, // 0=C ... 11=B
+    pub pitch: u8, // raw MIDI note number (0-127)
     pub start: Instant,
     pub end: Option<Instant>,
     pub velocity: u8,
@@ -14,8 +14,8 @@ pub struct NoteHit {
 /// Discrete actions parsed from raw MIDI bytes relevant to the piano roll
 #[derive(Clone, Debug)]
 pub enum NoteAction {
-    On { pc: u8, vel: u8, time: Instant },
-    Off { pc: u8, time: Instant },
+    On { pitch: u8, vel: u8, time: Instant },
+    Off { pitch: u8, time: Instant },
 }
 
 /// Parse raw MIDI bytes into a NoteAction if it's a Note On/Off message.
@@ -28,19 +28,19 @@ pub fn parse_note_action(bytes: &[u8], ts: Instant) -> Option<NoteAction> {
         let kind = status & 0xF0;
         match kind {
             0x90 => {
-                let pc = data1 % 12;
+                let pitch = data1; // full MIDI note number
                 if data2 != 0 {
                     Some(NoteAction::On {
-                        pc,
+                        pitch,
                         vel: data2,
                         time: ts,
                     })
                 } else {
-                    Some(NoteAction::Off { pc, time: ts })
+                    Some(NoteAction::Off { pitch, time: ts })
                 }
             }
             0x80 => Some(NoteAction::Off {
-                pc: data1 % 12,
+                pitch: data1,
                 time: ts,
             }),
             _ => None,

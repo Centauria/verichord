@@ -244,7 +244,7 @@ impl MidiApp {
             // process note actions using helper from midi module
             if let Some(action) = parse_note_action(&bytes, ts) {
                 match action {
-                    NoteAction::On { pc, vel, time } => {
+                    NoteAction::On { pitch, vel, time } => {
                         // start scrolling from the first Note On timestamp
                         if self.start_time.is_none() {
                             // reset start state and clear generated chords so the chord cards restart from measure 1
@@ -259,18 +259,18 @@ impl MidiApp {
                             ));
                         }
                         self.note_hits.push(NoteHit {
-                            pitch_class: pc,
+                            pitch: pitch,
                             start: time,
                             end: None,
                             velocity: vel,
                         });
                     }
-                    NoteAction::Off { pc, time } => {
+                    NoteAction::Off { pitch, time } => {
                         if let Some(hit) = self
                             .note_hits
                             .iter_mut()
                             .rev()
-                            .find(|h| h.pitch_class == pc && h.end.is_none())
+                            .find(|h| h.pitch == pitch && h.end.is_none())
                         {
                             hit.end = Some(time);
                         }
@@ -900,7 +900,8 @@ impl eframe::App for MidiApp {
                             let x0 = x_start.min(x_end);
                             let x1 = x_start.max(x_end);
 
-                            let row = hit.pitch_class as usize;
+                            let pitch_class = (hit.pitch % 12) as usize;
+                            let row = pitch_class;
                             let y = grid_bottom - (row as f32 + 1.0) * row_h;
 
                             let rect = egui::Rect::from_min_max(
