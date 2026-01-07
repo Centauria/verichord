@@ -474,7 +474,7 @@ impl eframe::App for MidiApp {
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             // Menu bar for settings
-            egui::menu::bar(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("Settings", |ui| {
                     ui.separator();
                     ui.label("Scroll Mode:");
@@ -498,14 +498,14 @@ impl eframe::App for MidiApp {
                         ui.label("Time signature");
                         ui.add(
                             egui::DragValue::new(&mut self.time_sig_a)
-                                .clamp_range(1..=16)
+                                .range(1..=16)
                                 .speed(0.25),
                         );
                         ui.label("/");
                         let prev_b = self.time_sig_b;
                         ui.add(
                             egui::DragValue::new(&mut self.time_sig_b)
-                                .clamp_range(2..=16)
+                                .range(2..=16)
                                 .speed(0.25),
                         );
                         if self.time_sig_b != prev_b && !matches!(self.time_sig_b, 2 | 4 | 8 | 16) {

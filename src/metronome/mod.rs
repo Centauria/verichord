@@ -1,4 +1,4 @@
-use rodio::{OutputStream, Sink, buffer::SamplesBuffer};
+use rodio::{Sink, buffer::SamplesBuffer};
 use spin_sleep::SpinSleeper;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -37,7 +37,7 @@ impl Metronome {
         // Spawn thread
         thread::spawn(move || {
             // Try to open default audio output once for the thread lifetime
-            let (_stream, stream_handle) = match OutputStream::try_default() {
+            let stream_handle = match rodio::OutputStreamBuilder::open_default_stream() {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Metronome: failed to open audio output: {}", e);
@@ -139,10 +139,9 @@ impl Metronome {
 
                     // create a sink and play the sample. `detach` allows it to keep playing without
                     // holding the sink handle in this thread.
-                    if let Ok(sink) = Sink::try_new(&stream_handle) {
-                        sink.append(source);
-                        sink.detach();
-                    }
+                    let sink = Sink::connect_new(&stream_handle.mixer());
+                    sink.append(source);
+                    sink.detach();
                 }
 
                 // advance by one beat

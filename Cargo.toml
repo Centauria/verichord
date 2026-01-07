@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.24"
-midir = "0.8"
+eframe = "0.33"
+midir = "0.10"
 wmidi = "4.0"
 # For timestamp formatting
 chrono = { version = "0.4", features = ["alloc"] }
 # Ensure winapi features used by eframe on Windows are enabled
 winapi = { version = "0.3", features = ["winuser", "windef"] }
-libloading = "0.8"
+libloading = "0.9"
 
 # Metronome audio/playback
-rodio = "0.18"
+rodio = "0.21"
 spin_sleep = "1.3"

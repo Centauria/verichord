@@ -5,17 +5,17 @@
 
 mod algo_load;
 mod chord;
+mod metronome;
 mod midi;
 mod rhythm;
-mod metronome;
-mod ui; 
+mod ui;
 
 fn main() {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "VeriChord",
         options,
-        Box::new(|_cc| Box::new(ui::MidiApp::default())),
+        Box::new(|_cc| Ok(Box::new(ui::MidiApp::default()))),
     )
     .unwrap();
 }
