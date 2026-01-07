@@ -58,6 +58,12 @@ impl Metronome {
             let mut next_instant = Instant::now();
             let mut beat_idx: usize = 0;
 
+            // Pre-generate click waveforms to avoid per-beat allocations and reduce jitter.
+            // These are small (~60ms at 44.1kHz) and cheap to clone when emitting a beat.
+            let sample_rate = 44_100;
+            let down_samples = generate_click_waveform(true, sample_rate);
+            let up_samples = generate_click_waveform(false, sample_rate);
+
             'outer: loop {
                 // Non-blocking command poll (drain all)
                 while let Ok(cmd) = rx.try_recv() {
@@ -133,9 +139,13 @@ impl Metronome {
                     } else {
                         beat_idx % cur_beats == 0
                     };
-                    // generate a short click waveform
-                    let samples = generate_click_waveform(is_downbeat, 44_100);
-                    let source = SamplesBuffer::new(1, 44_100, samples);
+                    // use pre-generated waveform, cloning the Vec to construct the SamplesBuffer
+                    let samples = if is_downbeat {
+                        down_samples.clone()
+                    } else {
+                        up_samples.clone()
+                    };
+                    let source = SamplesBuffer::new(1, sample_rate, samples);
 
                     // create a sink and play the sample. `detach` allows it to keep playing without
                     // holding the sink handle in this thread.
