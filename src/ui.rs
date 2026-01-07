@@ -3,6 +3,8 @@ use eframe::{egui, egui::ComboBox};
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+
+use crate::metronome::Metronome;
 use wmidi::MidiMessage;
 
 use crate::chord::PitchOrderedSet;
@@ -63,6 +65,9 @@ pub struct MidiApp {
     // index into `algos` for the selected algorithm (None == no plugin selected)
     selected_algo_idx: Option<usize>,
     power_save_mode: bool,
+    // metronome: play click on each beat when enabled
+    metronome_enabled: bool,
+    metronome: Option<Metronome>,
 }
 
 impl Default for MidiApp {
@@ -104,6 +109,8 @@ impl Default for MidiApp {
             algos: Vec::new(),
             selected_algo_idx: None,
             power_save_mode: false,
+            metronome_enabled: false,
+            metronome: None,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -257,6 +264,28 @@ impl MidiApp {
                                 PitchOrderedSet::from_intervals(Pitch::C, MAJ),
                                 std::time::Duration::ZERO,
                             ));
+
+                            // If the user has enabled the metronome in settings, start or enable it now
+                            if self.metronome_enabled {
+                                if let Some(m) = &self.metronome {
+                                    m.set_params(
+                                        self.tempo_bpm,
+                                        self.time_sig_a as usize,
+                                        self.time_sig_b,
+                                        true,
+                                    );
+                                    m.set_anchor(time);
+                                } else {
+                                    let m = Metronome::start(
+                                        self.tempo_bpm,
+                                        self.time_sig_a as usize,
+                                        self.time_sig_b,
+                                        true,
+                                    );
+                                    m.set_anchor(time);
+                                    self.metronome = Some(m);
+                                }
+                            }
                         }
                         self.note_hits.push(NoteHit {
                             pitch: pitch,
@@ -413,6 +442,34 @@ impl eframe::App for MidiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
 
+        // Manage metronome lifecycle and keep parameters in sync
+        if self.metronome_enabled && self.metronome.is_none() {
+            let enabled = self.metronome_enabled && self.start_time.is_some();
+            let m = Metronome::start(
+                self.tempo_bpm,
+                self.time_sig_a as usize,
+                self.time_sig_b,
+                enabled,
+            );
+            if let Some(st) = self.start_time {
+                m.set_anchor(st);
+            }
+            self.metronome = Some(m);
+        }
+        if !self.metronome_enabled && self.metronome.is_some() {
+            // dropping the Option will stop the metronome thread (Drop impl)
+            self.metronome = None;
+        }
+        if let Some(m) = &self.metronome {
+            let enabled = self.metronome_enabled && self.start_time.is_some();
+            m.set_params(
+                self.tempo_bpm,
+                self.time_sig_a as usize,
+                self.time_sig_b,
+                enabled,
+            );
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             // Menu bar for settings
             egui::menu::bar(ui, |ui| {
@@ -463,6 +520,8 @@ impl eframe::App for MidiApp {
 
                     ui.checkbox(&mut self.power_save_mode, "Power Save Mode")
                         .on_hover_text("When enabled, pause repaint when no notes are active to save CPU (default: off).");
+                    ui.checkbox(&mut self.metronome_enabled, "Metronome")
+                        .on_hover_text("When enabled, play a click sound on every beat of each measure (n beats per measure).");
 
                 });
             });

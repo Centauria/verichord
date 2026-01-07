@@ -7,7 +7,8 @@ mod algo_load;
 mod chord;
 mod midi;
 mod rhythm;
-mod ui;
+mod metronome;
+mod ui; 
 
 fn main() {
     let options = eframe::NativeOptions::default();
