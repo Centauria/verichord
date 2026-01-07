@@ -351,7 +351,9 @@ impl MidiApp {
             let notes_for_measure: Vec<crate::algo_load::NoteData> = {
                 let mut notes = Vec::new();
                 if let Some(st) = self.start_time {
-                    let beat_secs = 60.0 / (self.tempo_bpm as f32);
+                    // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
+                    let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                    let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
                     let beats_per_measure: usize = self.time_sig_a as usize;
                     let measure_secs = beat_secs * beats_per_measure as f32;
                     // We are predicting chord for measure `next` using notes from measure `src_measure`.
