@@ -474,7 +474,45 @@ impl eframe::App for MidiApp {
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             // Menu bar for settings
-            egui::MenuBar::new().ui(ui, |ui| {
+            let mut pending_algo_set: Option<(usize, String, String)> = None;
+        egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("Algorithm", |ui| {
+                    for (i, algo) in self.algos.iter().enumerate() {
+                        let algoname = algo.file_stem().unwrap_or_else(|| algo.name.clone());
+                        ui.menu_button(&algoname, |ui| {
+                            if let Some(opt_names) = algo.get_cached_option_names() {
+                                if opt_names.is_empty() {
+                                    ui.label("(no options)");
+                                } else {
+                                    for key in opt_names {
+                                        ui.menu_button(&key, |ui| {
+                                            if let Some(vals) = algo.get_cached_options_for(&key) {
+                                                // current value from plugin; if empty and plugin provided possible values,
+                                                // pre-select the first value and schedule setting it so the UI reflects a sensible initial state.
+                                                let mut cur = algo.get_cached_option_value(&key).unwrap_or_default();
+                                                if cur.is_empty() && !vals.is_empty() {
+                                                    let default = vals[0].clone();
+                                                    pending_algo_set = Some((i, key.clone(), default.clone()));
+                                                    cur = default;
+                                                }
+                                                for val in vals {
+                                                    if ui.selectable_label(cur == val, &val).clicked() {
+                                                        pending_algo_set = Some((i, key.clone(), val.clone()));
+                                                    }
+                                                }
+                                            } else {
+                                                ui.label("(no values)");
+                                            }
+                                        });
+                                    }
+                                }
+                            } else {
+                                ui.label("(no options)");
+                            }
+                        });
+                    }
+                });
+
                 ui.menu_button("Settings", |ui| {
                     ui.separator();
                     ui.label("Scroll Mode:");
@@ -527,6 +565,15 @@ impl eframe::App for MidiApp {
 
                 });
             });
+
+            if let Some((idx, key, val)) = pending_algo_set.take() {
+                if let Some(algo) = self.algos.get(idx) {
+                    match algo.set_option_value(&key, &val) {
+                        Ok(()) => self.status = format!("{}: {} = {}", algo.file_stem().unwrap_or_else(|| algo.name.clone()), key, val),
+                        Err(e) => self.status = format!("Failed to set {}: {}", key, e),
+                    }
+                }
+            }
 
             ui.horizontal(|ui| {
                 ui.label("MIDI Input:");
