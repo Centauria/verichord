@@ -82,6 +82,7 @@ pub struct MidiApp {
     chord_pending_scroll_index: Option<usize>,
     scrolling_active: bool,
     frozen_view_end: Option<Instant>,
+    recording_ended_at: Option<Instant>,
 
     // time signature a/b where a in 1..=16 and b in {2,4,8,16}
     time_sig_a: u8,
@@ -130,6 +131,7 @@ impl Default for MidiApp {
             chord_pending_scroll_index: None,
             scrolling_active: false,
             frozen_view_end: None,
+            recording_ended_at: None,
 
             time_sig_a: 4,
             time_sig_b: 4,
@@ -263,6 +265,7 @@ impl MidiApp {
                     // ensure no chord generation until first Note On
                     self.start_time = None;
                     self.scrolling_active = false;
+                    self.recording_ended_at = None;
                 }
                 Err(e) => {
                     self.status = format!("Failed to open: {}", e);
@@ -277,11 +280,31 @@ impl MidiApp {
         if let Some(conn) = self.connection.take() {
             drop(conn);
             self.status = "Closed".to_string();
+
+            // Calculate current view_end to freeze correctly (preserving bar snap if active)
+            let now = Instant::now();
+            let freeze_time = if let Some(start) = self.start_time {
+                match self.scroll_mode {
+                    ScrollMode::Smooth => now,
+                    ScrollMode::Bar => {
+                        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+                        let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                        let elapsed = now.duration_since(start).as_secs_f32();
+                        let measure_idx = (elapsed / measure_secs).floor();
+                        start
+                            + std::time::Duration::from_secs_f32((measure_idx + 1.0) * measure_secs)
+                    }
+                }
+            } else {
+                now
+            };
+
             // stop scrolling and freeze the current view so piano and chord windows stop moving
             self.scrolling_active = false;
-            self.frozen_view_end = Some(Instant::now());
-            // clear start_time so no new chords are generated while closed
-            self.start_time = None;
+            self.frozen_view_end = Some(freeze_time);
+            self.recording_ended_at = Some(freeze_time);
             // prevent automatic scroll of the chord strip
             self.chord_pending_scroll_index = None;
         } else {
@@ -516,7 +539,8 @@ impl eframe::App for MidiApp {
 
         // Manage metronome lifecycle and keep parameters in sync
         if self.metronome_enabled && self.metronome.is_none() {
-            let enabled = self.metronome_enabled && self.start_time.is_some();
+            let enabled =
+                self.metronome_enabled && self.start_time.is_some() && self.scrolling_active;
             let m = Metronome::start(
                 self.tempo_bpm,
                 self.time_sig_a as usize,
@@ -533,7 +557,8 @@ impl eframe::App for MidiApp {
             self.metronome = None;
         }
         if let Some(m) = &self.metronome {
-            let enabled = self.metronome_enabled && self.start_time.is_some();
+            let enabled =
+                self.metronome_enabled && self.start_time.is_some() && self.scrolling_active;
             m.set_params(
                 self.tempo_bpm,
                 self.time_sig_a as usize,
@@ -812,8 +837,8 @@ impl eframe::App for MidiApp {
                         ui_right.heading("Piano Roll");
                         ui_right.separator();
 
-                        let (r, _) = ui_right
-                            .allocate_exact_size(egui::vec2(right_w, height), egui::Sense::hover());
+                        let (r, resp) = ui_right
+                            .allocate_exact_size(egui::vec2(right_w, height), egui::Sense::drag());
                         let painter = ui_right.painter_at(r);
 
                         // background
@@ -872,6 +897,38 @@ impl eframe::App for MidiApp {
                         let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
                         let measure_secs = beat_secs * beats_per_measure as f32;
                         let window_secs = measure_secs * (self.measures as f32);
+
+                        if resp.dragged() {
+                            let delta_x = resp.drag_delta().x;
+                            // dragging right (positive) moves view window to the left (earlier time)
+                            let px_per_sec = right_w / window_secs;
+                            let dt = delta_x / px_per_sec;
+                            if let Some(fve) = self.frozen_view_end {
+                                let mut new_fve = if dt >= 0.0 {
+                                    fve.checked_sub(std::time::Duration::from_secs_f32(dt))
+                                        .unwrap_or(fve)
+                                } else {
+                                    fve + std::time::Duration::from_secs_f32(-dt)
+                                };
+
+                                // Constrain dragging: don't show area before start_time (at left edge)
+                                if let Some(start) = self.start_time {
+                                    let min_view_end =
+                                        start + std::time::Duration::from_secs_f32(window_secs);
+                                    if new_fve < min_view_end {
+                                        new_fve = min_view_end;
+                                    }
+                                    let max_view_end =
+                                        self.recording_ended_at.unwrap_or_else(Instant::now);
+                                    if new_fve > max_view_end {
+                                        new_fve = max_view_end;
+                                    }
+                                }
+                                self.frozen_view_end = Some(new_fve);
+                                // Ensure we stay in frozen mode (though dragged() implies it)
+                                self.scrolling_active = false;
+                            }
+                        }
 
                         // Map time signature to hierarchical beats for rhythm weighting.
                         // Special-case common compound time 6/8 -> [2,3], otherwise use top-level beats = a
@@ -1104,7 +1161,7 @@ impl eframe::App for MidiApp {
                         }
 
                         // chord generation per measure
-                        if let Some(start) = self.start_time {
+                        if let Some(start) = self.start_time.filter(|_| self.scrolling_active) {
                             // Use actual current time (now) to determine which measures are active.
                             // Using `view_end` (quantized in Bar mode) can cause an off-by-one where the view
                             // is already snapped to the end of the first measure and we end up generating
@@ -1115,26 +1172,22 @@ impl eframe::App for MidiApp {
                             self.ensure_chords_up_to(current_measure_idx);
                         }
 
-                        // cleanup old hits: keep if started or ended within window or if it's still active
-                        self.note_hits.retain(|h| {
-                            let start_in_window =
-                                view_end.duration_since(h.start).as_secs_f32() <= window_secs + 1.0;
-                            let end_in_window = h
-                                .end
-                                .map(|e| {
-                                    view_end.duration_since(e).as_secs_f32() <= window_secs + 1.0
-                                })
-                                .unwrap_or(false);
-                            start_in_window || end_in_window || h.end.is_none()
-                        });
-
                         // draw hits as rectangles spanning start..end (or start..view_end if active)
                         for hit in &self.note_hits {
+                            if hit.start > view_end {
+                                continue;
+                            }
                             // determine ages relative to view_end
                             let start_age = view_end.duration_since(hit.start).as_secs_f32();
                             let end_age = hit
                                 .end
-                                .map(|e| view_end.duration_since(e).as_secs_f32())
+                                .map(|e| {
+                                    if e > view_end {
+                                        0.0
+                                    } else {
+                                        view_end.duration_since(e).as_secs_f32()
+                                    }
+                                })
                                 .unwrap_or(0.0);
                             // skip completely out-of-window elements
                             if start_age > window_secs
