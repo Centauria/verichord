@@ -1,6 +1,7 @@
 use chrono::Local;
 use eframe::{egui, egui::ComboBox};
 use midir::{Ignore, MidiInput, MidiInputConnection};
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -25,10 +26,40 @@ fn format_duration_adaptive(d: Duration) -> String {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ScrollMode {
     Smooth,
     Bar,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(default)]
+pub struct AppState {
+    pub tempo_bpm: u32,
+    pub scroll_mode: ScrollMode,
+    pub log_width_frac: f32,
+    pub measures: u32,
+    pub time_sig_a: u8,
+    pub time_sig_b: u32,
+    pub metronome_enabled: bool,
+    pub power_save_mode: bool,
+    pub selected_algo_idx: Option<usize>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            tempo_bpm: 120,
+            scroll_mode: ScrollMode::Smooth,
+            log_width_frac: 0.35,
+            measures: 2,
+            time_sig_a: 4,
+            time_sig_b: 4,
+            metronome_enabled: false,
+            power_save_mode: false,
+            selected_algo_idx: None,
+        }
+    }
 }
 
 pub struct MidiApp {
@@ -120,6 +151,30 @@ impl Default for MidiApp {
 }
 
 impl MidiApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+
+        if let Some(storage) = cc.storage {
+            if let Some(state) = eframe::get_value::<AppState>(storage, eframe::APP_KEY) {
+                app.tempo_bpm = state.tempo_bpm;
+                app.scroll_mode = state.scroll_mode;
+                app.log_width_frac = state.log_width_frac;
+                app.measures = state.measures;
+                app.time_sig_a = state.time_sig_a;
+                app.time_sig_b = state.time_sig_b;
+                app.metronome_enabled = state.metronome_enabled;
+                app.power_save_mode = state.power_save_mode;
+                app.selected_algo_idx = state.selected_algo_idx;
+            }
+        }
+
+        // Refresh ports/algos to ensure valid state even if loaded config is stale
+        app.refresh_ports();
+        app.refresh_algos();
+
+        app
+    }
+
     fn refresh_ports(&mut self) {
         self.ports.clear();
         let list = self.midi_in.ports();
@@ -441,6 +496,21 @@ impl MidiApp {
 }
 
 impl eframe::App for MidiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let state = AppState {
+            tempo_bpm: self.tempo_bpm,
+            scroll_mode: self.scroll_mode,
+            log_width_frac: self.log_width_frac,
+            measures: self.measures,
+            time_sig_a: self.time_sig_a,
+            time_sig_b: self.time_sig_b,
+            metronome_enabled: self.metronome_enabled,
+            power_save_mode: self.power_save_mode,
+            selected_algo_idx: self.selected_algo_idx,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &state);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
 
