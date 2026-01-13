@@ -11,6 +11,16 @@ use wmidi::MidiMessage;
 use crate::chord::PitchOrderedSet;
 use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 
+// In release mode, shadow println!/print! to avoid blocking I/O issues on Windows
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        if false {
+            let _ = format_args!($($arg)*);
+        }
+    };
+}
+
 fn format_duration_adaptive(d: Duration) -> String {
     let ns = d.as_nanos() as f64;
     if ns >= 1_000_000_000.0 {
@@ -120,11 +130,7 @@ impl Default for MidiApp {
             start_time: None,
             measures: 2,
             log_width_frac: 0.35_f32,
-            chords: vec![(
-                1,
-                PitchOrderedSet::new(),
-                std::time::Duration::ZERO,
-            )],
+            chords: vec![(1, PitchOrderedSet::new(), std::time::Duration::ZERO)],
             chords_auto_scroll: true,
             chord_pending_scroll_index: None,
             scrolling_active: false,
@@ -250,11 +256,8 @@ impl MidiApp {
                     self.log.clear();
                     self.note_hits.clear();
                     self.chords.clear();
-                    self.chords.push((
-                        1,
-                        PitchOrderedSet::new(),
-                        std::time::Duration::ZERO,
-                    ));
+                    self.chords
+                        .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
                     self.chord_pending_scroll_index = None;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
