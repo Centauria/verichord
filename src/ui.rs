@@ -124,7 +124,7 @@ impl Default for MidiApp {
             log_width_frac: 0.35_f32,
             chords: vec![(
                 1,
-                PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                PitchOrderedSet::new(),
                 std::time::Duration::ZERO,
             )],
             chords_auto_scroll: true,
@@ -254,7 +254,7 @@ impl MidiApp {
                     self.chords.clear();
                     self.chords.push((
                         1,
-                        PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                        PitchOrderedSet::new(),
                         std::time::Duration::ZERO,
                     ));
                     self.chord_pending_scroll_index = None;
@@ -339,7 +339,7 @@ impl MidiApp {
                             self.chords.clear();
                             self.chords.push((
                                 1,
-                                PitchOrderedSet::from_intervals(Pitch::C, MAJ),
+                                PitchOrderedSet::new(),
                                 std::time::Duration::ZERO,
                             ));
 
