@@ -11,16 +11,6 @@ use wmidi::MidiMessage;
 use crate::chord::PitchOrderedSet;
 use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 
-// In release mode, shadow println!/print! to avoid blocking I/O issues on Windows
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
-macro_rules! println {
-    ($($arg:tt)*) => {
-        if false {
-            let _ = format_args!($($arg)*);
-        }
-    };
-}
-
 fn format_duration_adaptive(d: Duration) -> String {
     let ns = d.as_nanos() as f64;
     if ns >= 1_000_000_000.0 {
