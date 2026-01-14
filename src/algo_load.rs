@@ -3,7 +3,7 @@
 //!
 //! The plugin is expected to export the symbol with C linkage:
 //! ```cpp
-//! extern "C" uint32_t sample_next_chord(uint32_t input);
+//! extern "C" uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
 //! ```
 //!
 //! Example usage in Rust:
@@ -11,7 +11,8 @@
 //! let algos = algo_load::find_algos_in_exe_dir().unwrap_or_default();
 //! for a in &algos {
 //!     if a.has_sample_next_chord() {
-//!         let out = a.sample_next_chord(42).unwrap();
+//!         // example: input=42, no notes, 4 beats per bar
+//!         let out = a.sample_next_chord(42, &[], 4).unwrap();
 //!         println!("{} -> {}", a.name, out);
 //!     }
 //! }
@@ -27,7 +28,7 @@ use std::{
 
 use libloading::Library;
 
-/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count);
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
 ///
 /// The `NoteData` structure (C layout):
 /// ```c
@@ -47,8 +48,8 @@ pub struct NoteData {
     pub velocity: f32,
 }
 
-/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count);
-pub type SampleNextChordFn = unsafe extern "C" fn(u32, *const NoteData, usize) -> u32;
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
+pub type SampleNextChordFn = unsafe extern "C" fn(u32, *const NoteData, usize, u32) -> u32;
 
 /// Represents a loaded algorithm library. Keeps the `Library` handle alive
 /// to ensure any obtained function pointers remain valid while the struct lives.
@@ -153,16 +154,21 @@ impl AlgoLib {
         self.sample_next_chord
     }
 
-    /// Call `sample_next_chord` with normalized note data. Returns `Some(result)` if available.
+    /// Call `sample_next_chord` with normalized note data and the number of beats per bar. Returns `Some(result)` if available.
     #[allow(dead_code)]
-    pub fn sample_next_chord(&self, input: u32, notes: &[NoteData]) -> Option<u32> {
+    pub fn sample_next_chord(
+        &self,
+        input: u32,
+        notes: &[NoteData],
+        beats_per_bar: u32,
+    ) -> Option<u32> {
         let ptr = if notes.is_empty() {
             std::ptr::null()
         } else {
             notes.as_ptr()
         };
         self.sample_next_chord
-            .map(|f| unsafe { f(input, ptr, notes.len()) })
+            .map(|f| unsafe { f(input, ptr, notes.len(), beats_per_bar) })
     }
 
     /// Return the filename without extension (file stem) if available.

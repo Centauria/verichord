@@ -502,7 +502,12 @@ impl MidiApp {
                     note.velocity
                 );
             }
-            let chord = generate_chord_for_measure(last_chord, sample_fn, &notes_for_measure);
+            let chord = generate_chord_for_measure(
+                last_chord,
+                sample_fn,
+                &notes_for_measure,
+                self.time_sig_a as u32,
+            );
             let elapsed = start.elapsed();
             println!(
                 "Generated chord for measure {}:\t{:032b} [{} ns]",
