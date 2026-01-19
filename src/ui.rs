@@ -81,6 +81,8 @@ pub struct MidiApp {
     scrolling_active: bool,
     frozen_view_end: Option<Instant>,
     recording_ended_at: Option<Instant>,
+    /// True when user has started recording (via Record button / Space). MIDI input shouldn't auto-start recording when false.
+    recording_enabled: bool,
 
     // time signature a/b where a in 1..=16 and b in {2,4,8,16}
     time_sig_a: u8,
@@ -126,6 +128,7 @@ impl Default for MidiApp {
             scrolling_active: false,
             frozen_view_end: None,
             recording_ended_at: None,
+            recording_enabled: false,
 
             time_sig_a: 4,
             time_sig_b: 4,
@@ -257,6 +260,8 @@ impl MidiApp {
                     self.start_time = None;
                     self.scrolling_active = false;
                     self.recording_ended_at = None;
+                    // require user to explicitly start recording (Record button / Space)
+                    self.recording_enabled = false;
                 }
                 Err(e) => {
                     self.status = format!("Failed to open: {}", e);
@@ -303,6 +308,77 @@ impl MidiApp {
         }
     }
 
+    fn start_recording(&mut self, anchor: Instant) {
+        self.recording_enabled = true;
+        self.start_time = Some(anchor);
+        self.scrolling_active = true;
+        self.frozen_view_end = None;
+        // Clear old generated content so re-recording starts fresh
+        self.chords.clear();
+        self.chords
+            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
+        self.chord_pending_scroll_index = None;
+        // Clear prior MIDI hits and event log to avoid showing previous recordings
+        self.note_hits.clear();
+        self.log.clear();
+        self.recording_ended_at = None;
+
+        // Update status bar with start time
+        self.status = format!("Recording started at {}", Local::now().format("%H:%M:%S"));
+
+        // If the user has enabled the metronome in settings, start or enable it now
+        if self.metronome_enabled {
+            if let Some(m) = &self.metronome {
+                m.set_params(
+                    self.tempo_bpm,
+                    self.time_sig_a as usize,
+                    self.time_sig_b,
+                    true,
+                );
+                m.set_anchor(anchor);
+            } else {
+                let m = Metronome::start(
+                    self.tempo_bpm,
+                    self.time_sig_a as usize,
+                    self.time_sig_b,
+                    true,
+                );
+                m.set_anchor(anchor);
+                self.metronome = Some(m);
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let now = Instant::now();
+        let freeze_time = if let Some(start) = self.start_time {
+            match self.scroll_mode {
+                ScrollMode::Smooth => now,
+                ScrollMode::Bar => {
+                    let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                    let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+                    let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                    let elapsed = now.duration_since(start).as_secs_f32();
+                    let measure_idx = (elapsed / measure_secs).floor();
+                    start + std::time::Duration::from_secs_f32((measure_idx + 1.0) * measure_secs)
+                }
+            }
+        } else {
+            now
+        };
+
+        // stop scrolling and freeze the current view so piano and chord windows stop moving
+        self.scrolling_active = false;
+        self.frozen_view_end = Some(freeze_time);
+        self.recording_ended_at = Some(freeze_time);
+        self.chord_pending_scroll_index = None;
+        self.recording_enabled = false;
+
+        // Update status bar with stop time
+        self.status = format!("Recording stopped at {}", Local::now().format("%H:%M:%S"));
+    }
+
     fn drain_messages(&mut self) {
         while let Ok((bytes, ts)) = self.rx.try_recv() {
             let time = Local::now();
@@ -321,56 +397,63 @@ impl MidiApp {
             if let Some(action) = parse_note_action(&bytes, ts) {
                 match action {
                     NoteAction::On { pitch, vel, time } => {
-                        // start scrolling from the first Note On timestamp
+                        // start scrolling from the first Note On timestamp, but only if user enabled recording (Record button / Space)
                         if self.start_time.is_none() {
-                            // reset start state and clear generated chords so the chord cards restart from measure 1
-                            self.start_time = Some(time);
-                            self.scrolling_active = true;
-                            self.frozen_view_end = None;
-                            self.chords.clear();
-                            self.chords.push((
-                                1,
-                                PitchOrderedSet::new(),
-                                std::time::Duration::ZERO,
-                            ));
+                            if self.recording_enabled {
+                                // reset start state and clear generated chords so the chord cards restart from measure 1
+                                self.start_time = Some(time);
+                                self.scrolling_active = true;
+                                self.frozen_view_end = None;
+                                self.chords.clear();
+                                self.chords.push((
+                                    1,
+                                    PitchOrderedSet::new(),
+                                    std::time::Duration::ZERO,
+                                ));
 
-                            // If the user has enabled the metronome in settings, start or enable it now
-                            if self.metronome_enabled {
-                                if let Some(m) = &self.metronome {
-                                    m.set_params(
-                                        self.tempo_bpm,
-                                        self.time_sig_a as usize,
-                                        self.time_sig_b,
-                                        true,
-                                    );
-                                    m.set_anchor(time);
-                                } else {
-                                    let m = Metronome::start(
-                                        self.tempo_bpm,
-                                        self.time_sig_a as usize,
-                                        self.time_sig_b,
-                                        true,
-                                    );
-                                    m.set_anchor(time);
-                                    self.metronome = Some(m);
+                                // If the user has enabled the metronome in settings, start or enable it now
+                                if self.metronome_enabled {
+                                    if let Some(m) = &self.metronome {
+                                        m.set_params(
+                                            self.tempo_bpm,
+                                            self.time_sig_a as usize,
+                                            self.time_sig_b,
+                                            true,
+                                        );
+                                        m.set_anchor(time);
+                                    } else {
+                                        let m = Metronome::start(
+                                            self.tempo_bpm,
+                                            self.time_sig_a as usize,
+                                            self.time_sig_b,
+                                            true,
+                                        );
+                                        m.set_anchor(time);
+                                        self.metronome = Some(m);
+                                    }
                                 }
                             }
                         }
-                        self.note_hits.push(NoteHit {
-                            pitch: pitch,
-                            start: time,
-                            end: None,
-                            velocity: vel,
-                        });
+                        // Only record note hits if recording has started (start_time set)
+                        if self.start_time.is_some() {
+                            self.note_hits.push(NoteHit {
+                                pitch: pitch,
+                                start: time,
+                                end: None,
+                                velocity: vel,
+                            });
+                        }
                     }
                     NoteAction::Off { pitch, time } => {
-                        if let Some(hit) = self
-                            .note_hits
-                            .iter_mut()
-                            .rev()
-                            .find(|h| h.pitch == pitch && h.end.is_none())
-                        {
-                            hit.end = Some(time);
+                        if self.start_time.is_some() {
+                            if let Some(hit) = self
+                                .note_hits
+                                .iter_mut()
+                                .rev()
+                                .find(|h| h.pitch == pitch && h.end.is_none())
+                            {
+                                hit.end = Some(time);
+                            }
                         }
                     }
                 }
@@ -561,6 +644,18 @@ impl eframe::App for MidiApp {
                 self.time_sig_b,
                 enabled,
             );
+        }
+
+        // Spacebar toggles recording (only when a port is open). Use event-based detection for compatibility across egui versions.
+        let space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space));
+        if space_pressed && self.connection.is_some() {
+            let is_recording = self.start_time.is_some() && self.scrolling_active;
+            if is_recording {
+                self.stop_recording();
+            } else {
+                self.start_recording(Instant::now());
+            }
+            ctx.request_repaint();
         }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -830,7 +925,71 @@ impl eframe::App for MidiApp {
                     egui::vec2(right_w, height),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui_right| {
-                        ui_right.heading("Piano Roll");
+                        // Heading with record button on the right
+                        ui_right.horizontal(|ui_h| {
+                            ui_h.heading("Piano Roll");
+
+                            // Circular record button to the right of the title
+                            // Match chord auto-scroll sizing/margins: 26px button, 12px right margin
+                            let sz: f32 = 26.0;
+                            let rem = ui_h.available_width();
+                            let right_margin: f32 = 12.0;
+                            let push = (rem - (sz + right_margin)).max(0.0);
+                            ui_h.add_space(push);
+
+                            let (rect, resp) =
+                                ui_h.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                            let resp = resp.on_hover_text("Record (Space)");
+
+                            // determine state and colors
+                            let is_open = self.connection.is_some();
+                            let is_recording = self.start_time.is_some() && self.scrolling_active;
+
+                            let painter = ui_h.painter_at(rect);
+                            let center = rect.center();
+                            let radius = sz * 0.5;
+
+                            if !is_open {
+                                // disabled gray circle
+                                painter.circle_filled(center, radius, egui::Color32::from_gray(70));
+                                painter.text(
+                                    center,
+                                    egui::Align2::CENTER_CENTER,
+                                    "●",
+                                    egui::FontId::proportional(14.0),
+                                    egui::Color32::from_gray(140),
+                                );
+                            } else if is_recording {
+                                // active: red circle with white stop square
+                                painter.circle_filled(
+                                    center,
+                                    radius,
+                                    egui::Color32::from_rgb(200, 40, 40),
+                                );
+                                let sq = sz * 0.45;
+                                let sq_rect =
+                                    egui::Rect::from_center_size(center, egui::vec2(sq, sq));
+                                painter.rect_filled(sq_rect, 3.0, egui::Color32::WHITE);
+                            } else {
+                                // armed/ready: dark red circle with white dot
+                                painter.circle_filled(
+                                    center,
+                                    radius,
+                                    egui::Color32::from_rgb(170, 50, 50),
+                                );
+                                painter.circle_filled(center, radius * 0.42, egui::Color32::WHITE);
+                            }
+
+                            if is_open && resp.clicked() {
+                                if is_recording {
+                                    self.stop_recording();
+                                } else {
+                                    self.start_recording(Instant::now());
+                                }
+                                ctx.request_repaint();
+                            }
+                        });
+
                         ui_right.separator();
 
                         let (r, resp) = ui_right
