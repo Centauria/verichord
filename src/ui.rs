@@ -1647,6 +1647,65 @@ impl eframe::App for MidiApp {
                     self.refresh_algos();
                 }
 
+                // Regenerate: rebuild all chord cards from piano notes (re-run generation using same input)
+                if ui.button("Regenerate").clicked() {
+                    // If no notes, do nothing meaningful
+                    if self.note_hits.is_empty() {
+                        self.status = "Regenerate: no piano notes available".to_string();
+                    } else {
+                        // Reset chords to initial state
+                        self.chords.clear();
+                        self.chords
+                            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
+
+                        // Compute anchor start/end similar to save_piano_to_file
+                        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+                        let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                        let start_anchor = if let Some(s) = self.start_time {
+                            s
+                        } else {
+                            self.note_hits.iter().fold(Instant::now(), |min, h| {
+                                if h.start < min { h.start } else { min }
+                            })
+                        };
+
+                        let end_anchor = if let Some(ea) = self.recording_ended_at {
+                            ea
+                        } else {
+                            self.note_hits.iter().fold(Instant::now(), |max, h| {
+                                let candidate = h.end.unwrap_or(h.start);
+                                if candidate > max { candidate } else { max }
+                            })
+                        };
+
+                        let total_secs = if end_anchor > start_anchor {
+                            (end_anchor - start_anchor).as_secs_f32()
+                        } else {
+                            0.0
+                        };
+
+                        // Determine how many source measures of notes exist
+                        let measures_present = if total_secs <= 0.0 {
+                            1u32
+                        } else {
+                            (total_secs / measure_secs).ceil() as u32
+                        };
+
+                        // We want to generate chords at each measure end; ensure_chords_up_to expects a target measure index
+                        // and generates chords up to that measure. Since chord for measure (n+1) is generated from notes in measure n,
+                        // to produce chords for ends of measures 1..measures_present we call up_to = measures_present + 1
+                        let target = measures_present.saturating_add(1);
+
+                        // Generate
+                        self.ensure_chords_up_to(target);
+                        ui.ctx().request_repaint();
+
+                        self.status = format!("Regenerated chords up to measure {}", target);
+                    }
+                }
+
                 // push the auto-scroll toggle to the far right of the header, leaving a small right margin
                 let sz: f32 = 26.0;
                 let rem_after = ui.available_width();
