@@ -11,6 +11,11 @@ use wmidi::MidiMessage;
 use crate::chord::PitchOrderedSet;
 use crate::midi::{NoteAction, NoteHit, generate_chord_for_measure, parse_note_action};
 
+use rfd::FileDialog;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
+
 fn format_duration_adaptive(d: Duration) -> String {
     let ns = d.as_nanos() as f64;
     if ns >= 1_000_000_000.0 {
@@ -78,6 +83,7 @@ pub struct MidiApp {
     chords: Vec<(u32, PitchOrderedSet, Duration)>,
     chords_auto_scroll: bool,
     chord_pending_scroll_index: Option<usize>,
+    save_path: Option<PathBuf>,
     scrolling_active: bool,
     frozen_view_end: Option<Instant>,
     recording_ended_at: Option<Instant>,
@@ -125,6 +131,7 @@ impl Default for MidiApp {
             chords: vec![(1, PitchOrderedSet::new(), std::time::Duration::ZERO)],
             chords_auto_scroll: true,
             chord_pending_scroll_index: None,
+            save_path: None,
             scrolling_active: false,
             frozen_view_end: None,
             recording_ended_at: None,
@@ -595,6 +602,67 @@ impl MidiApp {
             next += 1;
         }
     }
+
+    fn save_piano_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        // Save recorded piano notes to a TSV file.
+        // Compute time units (seconds per quarter, beat, measure).
+        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+        let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+        // Pick anchors for start/end: prefer explicit values, otherwise use note bounds or now.
+        let start_anchor =
+            if let Some(s) = self.start_time {
+                s
+            } else {
+                self.note_hits.iter().fold(Instant::now(), |min, h| {
+                    if h.start < min { h.start } else { min }
+                })
+            };
+
+        let end_anchor = if let Some(ea) = self.recording_ended_at {
+            ea
+        } else {
+            self.note_hits.iter().fold(Instant::now(), |max, h| {
+                let candidate = h.end.unwrap_or(h.start);
+                if candidate > max { candidate } else { max }
+            })
+        };
+
+        let mut file = File::create(path).map_err(|e| e.to_string())?;
+
+        // Write notes between anchors as TSV lines: <pitch>\t<start_meas_pos>\t<end_meas_pos>\t<velocity>\n
+        for hit in &self.note_hits {
+            // Skip notes fully outside the anchor range
+            if hit.start > end_anchor {
+                continue;
+            }
+            let hit_end = hit.end.unwrap_or(end_anchor);
+            if hit_end < start_anchor {
+                continue;
+            }
+
+            let s_elapsed = hit.start.duration_since(start_anchor).as_secs_f32();
+            let s_measure_idx = (s_elapsed / measure_secs).floor() as i64;
+            let s_in_measure = ((s_elapsed - (s_measure_idx as f32) * measure_secs) / measure_secs)
+                .clamp(0.0_f32, 1.0_f32);
+            // measures are 1-based
+            let s_pos = (s_measure_idx as f64) + s_in_measure as f64 + 1.0;
+
+            let e_elapsed = hit_end.duration_since(start_anchor).as_secs_f32();
+            let e_measure_idx = (e_elapsed / measure_secs).floor() as i64;
+            let e_in_measure = ((e_elapsed - (e_measure_idx as f32) * measure_secs) / measure_secs)
+                .clamp(0.0_f32, 1.0_f32);
+            let e_pos = (e_measure_idx as f64) + e_in_measure as f64 + 1.0;
+
+            let velocity = hit.velocity;
+
+            let line = format!("{}\t{:.6}\t{:.6}\t{}\n", hit.pitch, s_pos, e_pos, velocity);
+            file.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
 }
 
 impl eframe::App for MidiApp {
@@ -662,6 +730,31 @@ impl eframe::App for MidiApp {
             // Menu bar for settings
             let mut pending_algo_set: Option<(usize, String, String)> = None;
         egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Save").clicked() {
+                        if let Some(path) = &self.save_path {
+                            match self.save_piano_to_file(path) {
+                                Ok(()) => self.status = format!("Saved to {}", path.display()),
+                                Err(e) => self.status = format!("Save failed: {}", e),
+                            }
+                        } else {
+                            if let Some(p) = FileDialog::new().set_title("Save piano as").add_filter("TSV", &["tsv"]).save_file() {
+                                match self.save_piano_to_file(&p) {
+                                    Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Saved to {}", p.display()); },
+                                    Err(e) => self.status = format!("Save failed: {}", e),
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("Save as").clicked() {
+                        if let Some(p) = FileDialog::new().set_title("Save piano as").add_filter("TSV", &["tsv"]).save_file() {
+                            match self.save_piano_to_file(&p) {
+                                Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Saved to {}", p.display()); },
+                                Err(e) => self.status = format!("Save failed: {}", e),
+                            }
+                        }
+                    }
+                });
                 ui.menu_button("Algorithm", |ui| {
                     for (i, algo) in self.algos.iter().enumerate() {
                         let algoname = algo.file_stem().unwrap_or_else(|| algo.name.clone());
