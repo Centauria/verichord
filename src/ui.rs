@@ -663,6 +663,74 @@ impl MidiApp {
 
         Ok(())
     }
+
+    fn load_piano_from_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        // Read TSV and populate self.note_hits for display in piano roll.
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        // Compute time units (seconds per quarter, beat, measure) with current tempo/time signature
+        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+        let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+        let start_anchor = Instant::now();
+        let mut hits: Vec<crate::midi::NoteHit> = Vec::new();
+        let mut max_end_secs: f32 = 0.0;
+
+        for (lineno, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 4 {
+                return Err(format!("Invalid TSV at line {}: '{}'", lineno + 1, line));
+            }
+            let pitch: u8 = parts[0]
+                .parse()
+                .map_err(|e| format!("Invalid pitch on line {}: {}", lineno + 1, e))?;
+            let s_pos: f64 = parts[1]
+                .parse()
+                .map_err(|e| format!("Invalid start pos on line {}: {}", lineno + 1, e))?;
+            let e_pos: f64 = parts[2]
+                .parse()
+                .map_err(|e| format!("Invalid end pos on line {}: {}", lineno + 1, e))?;
+            let velocity: u8 = parts[3]
+                .parse()
+                .map_err(|e| format!("Invalid velocity on line {}: {}", lineno + 1, e))?;
+
+            // convert measure-based positions to seconds relative to start_anchor
+            let s_sec = ((s_pos - 1.0) as f32) * measure_secs;
+            let e_sec = ((e_pos - 1.0) as f32) * measure_secs;
+            if e_sec > max_end_secs {
+                max_end_secs = e_sec;
+            }
+
+            let start_time = start_anchor + std::time::Duration::from_secs_f32(s_sec.max(0.0));
+            let end_time = start_anchor + std::time::Duration::from_secs_f32(e_sec.max(0.0));
+
+            hits.push(crate::midi::NoteHit {
+                pitch,
+                start: start_time,
+                end: Some(end_time),
+                velocity,
+            });
+        }
+
+        // Apply loaded hits to state
+        self.note_hits = hits;
+        self.start_time = Some(start_anchor);
+        self.scrolling_active = false;
+        self.recording_enabled = false;
+        let frozen_end = start_anchor + std::time::Duration::from_secs_f32(max_end_secs.max(0.0));
+        self.frozen_view_end = Some(frozen_end);
+        self.recording_ended_at = Some(frozen_end);
+        self.chords.clear();
+        self.chords
+            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
+        self.save_path = Some(path.to_path_buf());
+
+        Ok(())
+    }
 }
 
 impl eframe::App for MidiApp {
@@ -731,6 +799,14 @@ impl eframe::App for MidiApp {
             let mut pending_algo_set: Option<(usize, String, String)> = None;
         egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    if ui.button("Open").clicked() {
+                        if let Some(p) = FileDialog::new().set_title("Open piano TSV").add_filter("TSV", &["tsv"]).pick_file() {
+                            match self.load_piano_from_file(&p) {
+                                Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Loaded {}", p.display()); },
+                                Err(e) => self.status = format!("Load failed: {}", e),
+                            }
+                        }
+                    }
                     if ui.button("Save").clicked() {
                         if let Some(path) = &self.save_path {
                             match self.save_piano_to_file(path) {
