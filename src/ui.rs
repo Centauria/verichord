@@ -1653,6 +1653,31 @@ impl eframe::App for MidiApp {
                     if self.note_hits.is_empty() {
                         self.status = "Regenerate: no piano notes available".to_string();
                     } else {
+                        // If the selected algorithm provides reset_state(), call it before regenerating
+                        if let Some(idx) = self.selected_algo_idx {
+                            if let Some(algo) = self.algos.get(idx) {
+                                if algo.has_reset_state() {
+                                    match algo.reset_state() {
+                                        Ok(()) => {
+                                            self.status = format!(
+                                                "{}: reset_state()",
+                                                algo.file_stem()
+                                                    .unwrap_or_else(|| algo.name.clone())
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.status = format!(
+                                                "Failed to reset {}: {}",
+                                                algo.file_stem()
+                                                    .unwrap_or_else(|| algo.name.clone()),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Reset chords to initial state
                         self.chords.clear();
                         self.chords

@@ -75,6 +75,8 @@ pub struct AlgoLib {
     get_option: Option<unsafe extern "C" fn(*const c_char) -> *const c_char>,
     // void set_option(const char *key, const char *value)
     set_option: Option<unsafe extern "C" fn(*const c_char, *const c_char)>,
+    // Optional reset function exported by plugin to clear internal state between runs
+    reset_state: Option<unsafe extern "C" fn()>,
     // Internal cache for options to avoid calling into plugin on every frame
     option_cache: std::cell::RefCell<Option<AlgoOptions>>,
 }
@@ -122,6 +124,11 @@ impl AlgoLib {
                 .map(|s| *s)
                 .ok();
 
+            let reset_state = lib
+                .get::<unsafe extern "C" fn()>(b"reset_state\0")
+                .map(|s| *s)
+                .ok();
+
             let name = path
                 .file_name()
                 .and_then(OsStr::to_str)
@@ -136,6 +143,7 @@ impl AlgoLib {
                 get_options,
                 get_option,
                 set_option,
+                reset_state,
                 option_cache: std::cell::RefCell::new(None),
             })
         }
@@ -320,6 +328,22 @@ impl AlgoLib {
         // update cache if present
         if let Some(opt) = self.option_cache.borrow_mut().as_mut() {
             opt.values.insert(key.to_string(), value.to_string());
+        }
+        Ok(())
+    }
+
+    /// Returns true if the plugin exports `reset_state()`.
+    pub fn has_reset_state(&self) -> bool {
+        self.reset_state.is_some()
+    }
+
+    /// Call `reset_state()` if exported.
+    pub fn reset_state(&self) -> Result<(), String> {
+        let f = self
+            .reset_state
+            .ok_or_else(|| "reset_state not exported".to_string())?;
+        unsafe {
+            f();
         }
         Ok(())
     }
