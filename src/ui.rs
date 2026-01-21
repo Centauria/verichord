@@ -29,6 +29,57 @@ fn format_duration_adaptive(d: Duration) -> String {
     }
 }
 
+/// Render a menu row that includes a right-aligned, monospace shortcut hint.
+/// Returns the `Response` for the whole row so callers can call `.clicked()` etc.
+fn menu_item_with_shortcut(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: &str,
+    desired_width: Option<f32>,
+) -> egui::Response {
+    use egui::{Align2, FontId, TextStyle};
+
+    // Reserve a menu row that is clickable; use provided desired_width if any, otherwise fall back to a reasonable default.
+    let height = ui.spacing().interact_size.y.max(18.0);
+    let width = desired_width.unwrap_or_else(|| ui.available_width().min(280.0));
+    let size = egui::vec2(width, height);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+
+    // Subtle hover/active background
+    if resp.hovered() || resp.is_pointer_button_down_on() {
+        let fill = ui.style().visuals.widgets.hovered.bg_fill;
+        painter.rect_filled(rect, 0.0, fill);
+    }
+
+    // Left label (normal text style)
+    let label_font = TextStyle::Button.resolve(ui.style());
+    painter.text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        label_font.clone(),
+        ui.style().visuals.text_color(),
+    );
+
+    // Right shortcut: use proportional font on macOS so symbols like ⌘ and ⇧ render reliably, otherwise monospace.
+    let shortcut_font = if cfg!(target_os = "macos") {
+        // Use a proportional font on macOS so symbols like ⌘ and ⇧ render reliably
+        FontId::proportional(label_font.size * 0.95)
+    } else {
+        FontId::monospace(label_font.size * 0.90)
+    };
+    painter.text(
+        rect.right_center(),
+        Align2::RIGHT_CENTER,
+        shortcut,
+        shortcut_font,
+        ui.style().visuals.text_color(),
+    );
+
+    resp
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ScrollMode {
     Smooth,
@@ -830,6 +881,51 @@ impl MidiApp {
     }
 }
 
+impl MidiApp {
+    fn handle_open_file(&mut self) {
+        if let Some(p) = FileDialog::new()
+            .set_title("Open piano TSV")
+            .add_filter("TSV", &["tsv"])
+            .pick_file()
+        {
+            match self.load_piano_from_file(&p) {
+                Ok(()) => {
+                    self.save_path = Some(p.clone());
+                    self.status = format!("Loaded {}", p.display());
+                }
+                Err(e) => self.status = format!("Load failed: {}", e),
+            }
+        }
+    }
+
+    fn handle_save(&mut self) {
+        if let Some(path) = &self.save_path {
+            match self.save_piano_to_file(path) {
+                Ok(()) => self.status = format!("Saved to {}", path.display()),
+                Err(e) => self.status = format!("Save failed: {}", e),
+            }
+        } else {
+            self.handle_save_as();
+        }
+    }
+
+    fn handle_save_as(&mut self) {
+        if let Some(p) = FileDialog::new()
+            .set_title("Save piano as")
+            .add_filter("TSV", &["tsv"])
+            .save_file()
+        {
+            match self.save_piano_to_file(&p) {
+                Ok(()) => {
+                    self.save_path = Some(p.clone());
+                    self.status = format!("Saved to {}", p.display());
+                }
+                Err(e) => self.status = format!("Save failed: {}", e),
+            }
+        }
+    }
+}
+
 impl eframe::App for MidiApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let state = AppState {
@@ -881,6 +977,27 @@ impl eframe::App for MidiApp {
 
         // Spacebar toggles recording (only when a port is open). Use event-based detection for compatibility across egui versions.
         let space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space));
+
+        // Keyboard shortcuts (use `command` so Ctrl on Win/Linux and Cmd on macOS both work)
+        let open_pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+        let save_pressed =
+            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift);
+        let save_as_pressed =
+            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift);
+
+        if open_pressed {
+            self.handle_open_file();
+            ctx.request_repaint();
+        }
+        if save_pressed {
+            self.handle_save();
+            ctx.request_repaint();
+        }
+        if save_as_pressed {
+            self.handle_save_as();
+            ctx.request_repaint();
+        }
+
         if space_pressed && self.connection.is_some() {
             let is_recording = self.start_time.is_some() && self.scrolling_active;
             if is_recording {
@@ -896,36 +1013,53 @@ impl eframe::App for MidiApp {
             let mut pending_algo_set: Option<(usize, String, String)> = None;
         egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open").clicked() {
-                        if let Some(p) = FileDialog::new().set_title("Open piano TSV").add_filter("TSV", &["tsv"]).pick_file() {
-                            match self.load_piano_from_file(&p) {
-                                Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Loaded {}", p.display()); },
-                                Err(e) => self.status = format!("Load failed: {}", e),
-                            }
-                        }
+                    // Platform-sensitive shortcut labels (use symbols on macOS)
+                    let open_shortcut = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+O" };
+                    let save_shortcut = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
+                    let save_as_shortcut = if cfg!(target_os = "macos") { "⌘⇧S" } else { "Ctrl+Shift+S" };
+
+                    // Compute an approximate width based on character counts and font sizes so the menu width
+                    // matches the widest item (approximation). Adjust constants below if you want tighter/looser sizing.
+                    let label_font = egui::TextStyle::Button.resolve(ui.style());
+                    let shortcut_font_size = if cfg!(target_os = "macos") {
+                        label_font.size * 0.95
+                    } else {
+                        label_font.size * 0.90
+                    };
+                    let approx_char_width = |ch_count: usize, font_size: f32| -> f32 {
+                        ch_count as f32 * font_size * 0.55
+                    };
+                    let gap = 24.0; // space between label and shortcut
+                    let padding = 12.0 * 2.0; // left + right padding estimate
+                    let w_open = approx_char_width("Open".chars().count(), label_font.size)
+                        + approx_char_width(open_shortcut.chars().count(), shortcut_font_size)
+                        + gap
+                        + padding;
+                    let w_save = approx_char_width("Save".chars().count(), label_font.size)
+                        + approx_char_width(save_shortcut.chars().count(), shortcut_font_size)
+                        + gap
+                        + padding;
+                    let w_save_as = approx_char_width("Save as".chars().count(), label_font.size)
+                        + approx_char_width(save_as_shortcut.chars().count(), shortcut_font_size)
+                        + gap
+                        + padding;
+                    let menu_width = w_open.max(w_save).max(w_save_as).max(120.0).min(420.0);
+
+                    if menu_item_with_shortcut(ui, "Open", open_shortcut, Some(menu_width)).clicked() {
+                        self.handle_open_file();
                     }
-                    if ui.button("Save").clicked() {
-                        if let Some(path) = &self.save_path {
-                            match self.save_piano_to_file(path) {
-                                Ok(()) => self.status = format!("Saved to {}", path.display()),
-                                Err(e) => self.status = format!("Save failed: {}", e),
-                            }
-                        } else {
-                            if let Some(p) = FileDialog::new().set_title("Save piano as").add_filter("TSV", &["tsv"]).save_file() {
-                                match self.save_piano_to_file(&p) {
-                                    Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Saved to {}", p.display()); },
-                                    Err(e) => self.status = format!("Save failed: {}", e),
-                                }
-                            }
-                        }
+                    if menu_item_with_shortcut(ui, "Save", save_shortcut, Some(menu_width)).clicked() {
+                        self.handle_save();
                     }
-                    if ui.button("Save as").clicked() {
-                        if let Some(p) = FileDialog::new().set_title("Save piano as").add_filter("TSV", &["tsv"]).save_file() {
-                            match self.save_piano_to_file(&p) {
-                                Ok(()) => { self.save_path = Some(p.clone()); self.status = format!("Saved to {}", p.display()); },
-                                Err(e) => self.status = format!("Save failed: {}", e),
-                            }
-                        }
+                    if menu_item_with_shortcut(
+                        ui,
+                        "Save as",
+                        save_as_shortcut,
+                        Some(menu_width),
+                    )
+                    .clicked()
+                    {
+                        self.handle_save_as();
                     }
                 });
                 ui.menu_button("Algorithm", |ui| {
