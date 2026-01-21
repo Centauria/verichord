@@ -443,9 +443,20 @@ impl MidiApp {
                         }
                         // Only record note hits if recording has started (start_time set)
                         if self.start_time.is_some() {
+                            // measure length in seconds at the current tempo/signature
+                            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                            let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                            let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                            let normalized = if let Some(st) = self.start_time {
+                                (time.duration_since(st).as_secs_f32()) / measure_secs
+                            } else {
+                                0.0
+                            };
+
                             self.note_hits.push(NoteHit {
                                 pitch: pitch,
-                                start: time,
+                                start: normalized,
                                 end: None,
                                 velocity: vel,
                             });
@@ -453,13 +464,23 @@ impl MidiApp {
                     }
                     NoteAction::Off { pitch, time } => {
                         if self.start_time.is_some() {
+                            // measure length in seconds at the current tempo/signature
+                            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                            let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                            let measure_secs = beat_secs * (self.time_sig_a as f32);
+
                             if let Some(hit) = self
                                 .note_hits
                                 .iter_mut()
                                 .rev()
                                 .find(|h| h.pitch == pitch && h.end.is_none())
                             {
-                                hit.end = Some(time);
+                                let normalized = if let Some(st) = self.start_time {
+                                    (time.duration_since(st).as_secs_f32()) / measure_secs
+                                } else {
+                                    hit.start
+                                };
+                                hit.end = Some(normalized);
                             }
                         }
                     }
@@ -509,7 +530,7 @@ impl MidiApp {
             // Build normalized NoteData for the *previous* measure (`next - 1`).
             let notes_for_measure: Vec<crate::algo_load::NoteData> = {
                 let mut notes = Vec::new();
-                if let Some(st) = self.start_time {
+                if self.start_time.is_some() {
                     // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
                     let quarter_secs = 60.0 / (self.tempo_bpm as f32);
                     let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
@@ -523,7 +544,8 @@ impl MidiApp {
                     let measure_end = (src_idx0 + 1.0) * measure_secs;
 
                     for hit in &self.note_hits {
-                        let s_elapsed = (hit.start - st).as_secs_f32();
+                        // convert normalized measure times to seconds relative to start_time
+                        let s_elapsed = hit.start * measure_secs;
 
                         // Exclude if note starts at/after measure end.
                         if s_elapsed >= measure_end {
@@ -532,7 +554,7 @@ impl MidiApp {
 
                         // Exclude if note ends at/before measure start.
                         if let Some(e) = hit.end {
-                            let e_elapsed = (e - st).as_secs_f32();
+                            let e_elapsed = e * measure_secs;
                             if e_elapsed <= measure_start {
                                 continue;
                             }
@@ -549,7 +571,7 @@ impl MidiApp {
                         // Notes still active at the measure boundary => end=1.0.
                         let e_norm = match hit.end {
                             Some(e) => {
-                                let e_elapsed = (e - st).as_secs_f32();
+                                let e_elapsed = e * measure_secs;
                                 if e_elapsed >= measure_end {
                                     1.0
                                 } else {
@@ -610,23 +632,27 @@ impl MidiApp {
         let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
         let measure_secs = beat_secs * (self.time_sig_a as f32);
 
-        // Pick anchors for start/end: prefer explicit values, otherwise use note bounds or now.
-        let start_anchor =
-            if let Some(s) = self.start_time {
-                s
-            } else {
-                self.note_hits.iter().fold(Instant::now(), |min, h| {
-                    if h.start < min { h.start } else { min }
-                })
-            };
+        // Pick anchors for start/end: prefer explicit values, otherwise derive from note bounds
+        let start_anchor = if let Some(s) = self.start_time {
+            s
+        } else {
+            let earliest_meas = self
+                .note_hits
+                .iter()
+                .map(|h| h.start)
+                .fold(std::f32::INFINITY, |m, v| m.min(v));
+            Instant::now() - std::time::Duration::from_secs_f32(earliest_meas * measure_secs)
+        };
 
         let end_anchor = if let Some(ea) = self.recording_ended_at {
             ea
         } else {
-            self.note_hits.iter().fold(Instant::now(), |max, h| {
-                let candidate = h.end.unwrap_or(h.start);
-                if candidate > max { candidate } else { max }
-            })
+            let latest_meas = self
+                .note_hits
+                .iter()
+                .map(|h| h.end.unwrap_or(h.start))
+                .fold(0.0_f32, |m, v| m.max(v));
+            start_anchor + std::time::Duration::from_secs_f32(latest_meas * measure_secs)
         };
 
         let mut file = File::create(path).map_err(|e| e.to_string())?;
@@ -638,23 +664,26 @@ impl MidiApp {
 
         // Write notes between anchors as TSV lines: <pitch>\t<start_meas_pos>\t<end_meas_pos>\t<velocity>\n
         for hit in &self.note_hits {
+            // Convert normalized measure times into seconds since start_anchor
+            let hit_start_secs = hit.start * measure_secs;
+            let hit_end_secs = hit.end.unwrap_or(hit.start) * measure_secs;
+
             // Skip notes fully outside the anchor range
-            if hit.start > end_anchor {
+            if hit_start_secs > end_anchor.duration_since(start_anchor).as_secs_f32() {
                 continue;
             }
-            let hit_end = hit.end.unwrap_or(end_anchor);
-            if hit_end < start_anchor {
+            if hit_end_secs < 0.0 {
                 continue;
             }
 
-            let s_elapsed = hit.start.duration_since(start_anchor).as_secs_f32();
+            let s_elapsed = hit_start_secs;
             let s_measure_idx = (s_elapsed / measure_secs).floor() as i64;
             let s_in_measure = ((s_elapsed - (s_measure_idx as f32) * measure_secs) / measure_secs)
                 .clamp(0.0_f32, 1.0_f32);
             // measures are 1-based
             let s_pos = (s_measure_idx as f64) + s_in_measure as f64 + 1.0;
 
-            let e_elapsed = hit_end.duration_since(start_anchor).as_secs_f32();
+            let e_elapsed = hit_end_secs;
             let e_measure_idx = (e_elapsed / measure_secs).floor() as i64;
             let e_in_measure = ((e_elapsed - (e_measure_idx as f32) * measure_secs) / measure_secs)
                 .clamp(0.0_f32, 1.0_f32);
@@ -743,19 +772,19 @@ impl MidiApp {
                 .map_err(|e| format!("Invalid velocity on line {}: {}", lineno + 1, e))?;
 
             // convert measure-based positions to seconds relative to start_anchor
-            let s_sec = ((s_pos - 1.0) as f32) * measure_secs;
             let e_sec = ((e_pos - 1.0) as f32) * measure_secs;
             if e_sec > max_end_secs {
                 max_end_secs = e_sec;
             }
 
-            let start_time = start_anchor + std::time::Duration::from_secs_f32(s_sec.max(0.0));
-            let end_time = start_anchor + std::time::Duration::from_secs_f32(e_sec.max(0.0));
+            // store normalized measure positions (1 measure == 1.0)
+            let start_meas = (s_pos - 1.0) as f32;
+            let end_meas = (e_pos - 1.0) as f32;
 
             hits.push(crate::midi::NoteHit {
                 pitch,
-                start: start_time,
-                end: Some(end_time),
+                start: start_meas,
+                end: Some(end_meas),
                 velocity,
             });
         }
@@ -1542,29 +1571,41 @@ impl eframe::App for MidiApp {
 
                         // draw hits as rectangles spanning start..end (or start..view_end if active)
                         for hit in &self.note_hits {
-                            if hit.start > view_end {
+                            // Need start anchor to convert normalized measure times to Instants
+                            let start_anchor = if let Some(sa) = self.start_time {
+                                sa
+                            } else {
+                                continue;
+                            };
+                            let hit_start_inst = start_anchor
+                                + std::time::Duration::from_secs_f32(hit.start * measure_secs);
+                            if hit_start_inst > view_end {
                                 continue;
                             }
                             // determine ages relative to view_end
-                            let start_age = view_end.duration_since(hit.start).as_secs_f32();
-                            let end_age = hit
-                                .end
-                                .map(|e| {
-                                    if e > view_end {
-                                        0.0
-                                    } else {
-                                        view_end.duration_since(e).as_secs_f32()
-                                    }
-                                })
-                                .unwrap_or(0.0);
+                            let start_age = view_end.duration_since(hit_start_inst).as_secs_f32();
+                            let end_age = if let Some(e) = hit.end {
+                                let hit_end_inst = start_anchor
+                                    + std::time::Duration::from_secs_f32(e * measure_secs);
+                                if hit_end_inst > view_end {
+                                    0.0
+                                } else {
+                                    view_end.duration_since(hit_end_inst).as_secs_f32()
+                                }
+                            } else {
+                                0.0
+                            };
+
                             // skip completely out-of-window elements
-                            if start_age > window_secs
-                                && hit
-                                    .end
-                                    .map(|e| view_end.duration_since(e).as_secs_f32())
-                                    .unwrap_or(0.0)
-                                    > window_secs
-                            {
+                            let end_age_for_check = if let Some(e) = hit.end {
+                                let hit_end_inst = start_anchor
+                                    + std::time::Duration::from_secs_f32(e * measure_secs);
+                                view_end.duration_since(hit_end_inst).as_secs_f32()
+                            } else {
+                                start_age
+                            };
+
+                            if start_age > window_secs && end_age_for_check > window_secs {
                                 continue;
                             }
 
@@ -1600,9 +1641,8 @@ impl eframe::App for MidiApp {
 
                             // Compute rhythm weight in-measure and draw it at the left edge of the note.
                             if let Some(start_anchor) = self.start_time {
-                                // start position within its measure
-                                let s_elapsed =
-                                    hit.start.duration_since(start_anchor).as_secs_f32();
+                                // start position within its measure (seconds)
+                                let s_elapsed = hit.start * measure_secs;
                                 let s_measure_idx = (s_elapsed / measure_secs).floor() as i64;
                                 let s_in_measure = ((s_elapsed
                                     - (s_measure_idx as f32) * measure_secs)
@@ -1611,7 +1651,7 @@ impl eframe::App for MidiApp {
 
                                 // end position: either explicit end, or current time's in-measure position
                                 let (e_in_measure, e_measure_idx) = if let Some(e) = hit.end {
-                                    let e_elapsed = e.duration_since(start_anchor).as_secs_f32();
+                                    let e_elapsed = e * measure_secs;
                                     let e_measure_idx = (e_elapsed / measure_secs).floor() as i64;
                                     let e_in_measure = ((e_elapsed
                                         - (e_measure_idx as f32) * measure_secs)
@@ -1732,21 +1772,31 @@ impl eframe::App for MidiApp {
                         let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
                         let measure_secs = beat_secs * (self.time_sig_a as f32);
 
+                        // Determine anchor instants for regeneration. If we don't have a start_time, derive one
+                        // such that the earliest normalized hit maps to a time in the past (preserving relative offsets).
+
                         let start_anchor = if let Some(s) = self.start_time {
                             s
                         } else {
-                            self.note_hits.iter().fold(Instant::now(), |min, h| {
-                                if h.start < min { h.start } else { min }
-                            })
+                            let earliest_meas = self
+                                .note_hits
+                                .iter()
+                                .map(|h| h.start)
+                                .fold(std::f32::INFINITY, |m, v| m.min(v));
+                            Instant::now()
+                                - std::time::Duration::from_secs_f32(earliest_meas * measure_secs)
                         };
 
                         let end_anchor = if let Some(ea) = self.recording_ended_at {
                             ea
                         } else {
-                            self.note_hits.iter().fold(Instant::now(), |max, h| {
-                                let candidate = h.end.unwrap_or(h.start);
-                                if candidate > max { candidate } else { max }
-                            })
+                            let latest_meas = self
+                                .note_hits
+                                .iter()
+                                .map(|h| h.end.unwrap_or(h.start))
+                                .fold(0.0_f32, |m, v| m.max(v));
+                            start_anchor
+                                + std::time::Duration::from_secs_f32(latest_meas * measure_secs)
                         };
 
                         let total_secs = if end_anchor > start_anchor {

@@ -3,11 +3,14 @@ use crate::chord::PitchOrderedSet;
 use std::time::Instant;
 
 /// Raw pitch note representation and sustain tracking
+/// start/end are normalized to measures where 1.0 == one measure length
 #[derive(Clone, Debug)]
 pub struct NoteHit {
     pub pitch: u8, // raw MIDI note number (0-127)
-    pub start: Instant,
-    pub end: Option<Instant>,
+    /// start time in *measures* relative to the recording anchor (measure units)
+    pub start: f32,
+    /// end time in *measures* (None if still active)
+    pub end: Option<f32>,
     pub velocity: u8,
 }
 
