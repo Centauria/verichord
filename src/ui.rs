@@ -631,6 +631,11 @@ impl MidiApp {
 
         let mut file = File::create(path).map_err(|e| e.to_string())?;
 
+        // Write metadata header lines (prefixed with '#')
+        let header = format!("# sig: {}/{}\n", self.time_sig_a, self.time_sig_b);
+        file.write_all(header.as_bytes())
+            .map_err(|e| e.to_string())?;
+
         // Write notes between anchors as TSV lines: <pitch>\t<start_meas_pos>\t<end_meas_pos>\t<velocity>\n
         for hit in &self.note_hits {
             // Skip notes fully outside the anchor range
@@ -667,7 +672,43 @@ impl MidiApp {
     fn load_piano_from_file(&mut self, path: &std::path::Path) -> Result<(), String> {
         // Read TSV and populate self.note_hits for display in piano roll.
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        // Compute time units (seconds per quarter, beat, measure) with current tempo/time signature
+        // Allow optional metadata header lines (prefixed with '#')
+        // Example: # sig: 3/4
+        let mut sig_a = self.time_sig_a;
+        let mut sig_b = self.time_sig_b;
+
+        // First pass: parse header lines only
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix('#') {
+                let rest = rest.trim();
+                if let Some(sig) = rest.strip_prefix("sig:") {
+                    let sig = sig.trim();
+                    let parts: Vec<&str> = sig.split('/').collect();
+                    if parts.len() == 2 {
+                        let a: u8 = parts[0]
+                            .trim()
+                            .parse()
+                            .map_err(|e| format!("Invalid sig numerator: {}", e))?;
+                        let b: u32 = parts[1]
+                            .trim()
+                            .parse()
+                            .map_err(|e| format!("Invalid sig denominator: {}", e))?;
+                        sig_a = a;
+                        sig_b = b;
+                    }
+                }
+            }
+        }
+
+        // Apply parsed time signature (if provided)
+        self.time_sig_a = sig_a;
+        self.time_sig_b = sig_b;
+
+        // Compute time units (seconds per quarter, beat, measure) with (possibly) updated time signature
         let quarter_secs = 60.0 / (self.tempo_bpm as f32);
         let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
         let measure_secs = beat_secs * (self.time_sig_a as f32);
@@ -679,6 +720,9 @@ impl MidiApp {
         for (lineno, line) in content.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('#') {
                 continue;
             }
             let parts: Vec<&str> = line.split('\t').collect();
