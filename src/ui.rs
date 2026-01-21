@@ -80,6 +80,19 @@ fn menu_item_with_shortcut(
     resp
 }
 
+// Extend `egui::Ui` with a convenience button that shows a right-aligned shortcut hint.
+// This delegates to `menu_item_with_shortcut` so visuals remain consistent with existing menu rows.
+trait ButtonWithShortcut {
+    fn button_with_shortcut(&mut self, label: &str, shortcut: &str) -> egui::Response;
+}
+
+impl ButtonWithShortcut for egui::Ui {
+    fn button_with_shortcut(&mut self, label: &str, shortcut: &str) -> egui::Response {
+        // Reuse the existing helper so both approaches stay visually consistent.
+        menu_item_with_shortcut(self, label, shortcut, None)
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ScrollMode {
     Smooth,
@@ -993,13 +1006,22 @@ impl eframe::App for MidiApp {
         // Spacebar toggles recording (only when a port is open). Use event-based detection for compatibility across egui versions.
         let space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space));
 
-        // Keyboard shortcuts (use `command` so Ctrl on Win/Linux and Cmd on macOS both work)
-        let new_pressed = ctx.input(|i| i.key_pressed(egui::Key::N) && i.modifiers.command);
-        let open_pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
-        let save_pressed =
-            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift);
-        let save_as_pressed =
-            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift);
+        // Keyboard shortcuts (use `command` so Ctrl on Win/Linux and Cmd on macOS both work).
+        // Use `consume_key` so handled shortcuts don't leak to other UI elements.
+        let new_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::N));
+        let open_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
+        // Save / Save as: prefer Save as when Shift is held
+        let save_as_pressed = ctx.input_mut(|i| {
+            let mut mods = egui::Modifiers::default();
+            mods.command = true;
+            mods.shift = true;
+            i.consume_key(mods, egui::Key::S)
+        });
+        let save_pressed = if !save_as_pressed {
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+        } else {
+            false
+        };
 
         if new_pressed {
             self.handle_new();
@@ -1039,56 +1061,23 @@ impl eframe::App for MidiApp {
                     let save_shortcut = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
                     let save_as_shortcut = if cfg!(target_os = "macos") { "⌘⇧S" } else { "Ctrl+Shift+S" };
 
-                    // Compute an approximate width based on character counts and font sizes so the menu width
-                    // matches the widest item (approximation). Adjust constants below if you want tighter/looser sizing.
-                    let label_font = egui::TextStyle::Button.resolve(ui.style());
-                    let shortcut_font_size = if cfg!(target_os = "macos") {
-                        label_font.size * 0.95
-                    } else {
-                        label_font.size * 0.90
-                    };
-                    let approx_char_width = |ch_count: usize, font_size: f32| -> f32 {
-                        ch_count as f32 * font_size * 0.55
-                    };
-                    let gap = 24.0; // space between label and shortcut
-                    let padding = 12.0 * 2.0; // left + right padding estimate
-                    let w_new = approx_char_width("New".chars().count(), label_font.size)
-                        + approx_char_width(new_shortcut.chars().count(), shortcut_font_size)
-                        + gap
-                        + padding;
-                    let w_open = approx_char_width("Open".chars().count(), label_font.size)
-                        + approx_char_width(open_shortcut.chars().count(), shortcut_font_size)
-                        + gap
-                        + padding;
-                    let w_save = approx_char_width("Save".chars().count(), label_font.size)
-                        + approx_char_width(save_shortcut.chars().count(), shortcut_font_size)
-                        + gap
-                        + padding;
-                    let w_save_as = approx_char_width("Save as".chars().count(), label_font.size)
-                        + approx_char_width(save_as_shortcut.chars().count(), shortcut_font_size)
-                        + gap
-                        + padding;
-                    let menu_width = w_open.max(w_save).max(w_save_as).max(w_new).max(120.0).min(420.0);
-
-                    if menu_item_with_shortcut(ui, "New", new_shortcut, Some(menu_width)).clicked() {
+                    // Use the Ui extension method to draw menu items with right-aligned shortcuts.
+                    if ui.button_with_shortcut("New", new_shortcut).clicked() {
                         self.handle_new();
+                        ui.close();
                     }
-                    if menu_item_with_shortcut(ui, "Open", open_shortcut, Some(menu_width)).clicked() {
+                    if ui.button_with_shortcut("Open", open_shortcut).clicked() {
                         self.handle_open_file();
+                        ui.close();
                     }
                     ui.separator();
-                    if menu_item_with_shortcut(ui, "Save", save_shortcut, Some(menu_width)).clicked() {
+                    if ui.button_with_shortcut("Save", save_shortcut).clicked() {
                         self.handle_save();
+                        ui.close();
                     }
-                    if menu_item_with_shortcut(
-                        ui,
-                        "Save as",
-                        save_as_shortcut,
-                        Some(menu_width),
-                    )
-                    .clicked()
-                    {
+                    if ui.button_with_shortcut("Save as", save_as_shortcut).clicked() {
                         self.handle_save_as();
+                        ui.close();
                     }
                 });
                 ui.menu_button("Algorithm", |ui| {
