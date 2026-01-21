@@ -882,6 +882,21 @@ impl MidiApp {
 }
 
 impl MidiApp {
+    fn handle_new(&mut self) {
+        // Reset piano state to a new, empty file
+        self.note_hits.clear();
+        self.start_time = None;
+        self.scrolling_active = false;
+        self.recording_enabled = false;
+        self.frozen_view_end = None;
+        self.recording_ended_at = None;
+        self.chords.clear();
+        self.chords
+            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
+        self.save_path = None;
+        self.status = "New file".to_string();
+    }
+
     fn handle_open_file(&mut self) {
         if let Some(p) = FileDialog::new()
             .set_title("Open piano TSV")
@@ -979,12 +994,17 @@ impl eframe::App for MidiApp {
         let space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space));
 
         // Keyboard shortcuts (use `command` so Ctrl on Win/Linux and Cmd on macOS both work)
+        let new_pressed = ctx.input(|i| i.key_pressed(egui::Key::N) && i.modifiers.command);
         let open_pressed = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
         let save_pressed =
             ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift);
         let save_as_pressed =
             ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift);
 
+        if new_pressed {
+            self.handle_new();
+            ctx.request_repaint();
+        }
         if open_pressed {
             self.handle_open_file();
             ctx.request_repaint();
@@ -1014,6 +1034,7 @@ impl eframe::App for MidiApp {
         egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     // Platform-sensitive shortcut labels (use symbols on macOS)
+                    let new_shortcut = if cfg!(target_os = "macos") { "⌘N" } else { "Ctrl+N" };
                     let open_shortcut = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+O" };
                     let save_shortcut = if cfg!(target_os = "macos") { "⌘S" } else { "Ctrl+S" };
                     let save_as_shortcut = if cfg!(target_os = "macos") { "⌘⇧S" } else { "Ctrl+Shift+S" };
@@ -1031,6 +1052,10 @@ impl eframe::App for MidiApp {
                     };
                     let gap = 24.0; // space between label and shortcut
                     let padding = 12.0 * 2.0; // left + right padding estimate
+                    let w_new = approx_char_width("New".chars().count(), label_font.size)
+                        + approx_char_width(new_shortcut.chars().count(), shortcut_font_size)
+                        + gap
+                        + padding;
                     let w_open = approx_char_width("Open".chars().count(), label_font.size)
                         + approx_char_width(open_shortcut.chars().count(), shortcut_font_size)
                         + gap
@@ -1043,11 +1068,15 @@ impl eframe::App for MidiApp {
                         + approx_char_width(save_as_shortcut.chars().count(), shortcut_font_size)
                         + gap
                         + padding;
-                    let menu_width = w_open.max(w_save).max(w_save_as).max(120.0).min(420.0);
+                    let menu_width = w_open.max(w_save).max(w_save_as).max(w_new).max(120.0).min(420.0);
 
+                    if menu_item_with_shortcut(ui, "New", new_shortcut, Some(menu_width)).clicked() {
+                        self.handle_new();
+                    }
                     if menu_item_with_shortcut(ui, "Open", open_shortcut, Some(menu_width)).clicked() {
                         self.handle_open_file();
                     }
+                    ui.separator();
                     if menu_item_with_shortcut(ui, "Save", save_shortcut, Some(menu_width)).clicked() {
                         self.handle_save();
                     }
