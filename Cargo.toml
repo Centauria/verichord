@@ -2,6 +2,16 @@
 name = "verichord"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[build-dependencies]
+resvg = "0.46"
+usvg = "0.46"
+tiny-skia = "0.11"
+png = "0.18"
+ico = "0.5"
+icns = "0.3"
+winres = "0.1"
 
 [dependencies]
 eframe = { version = "0.33", features = ["persistence"] }
