@@ -110,6 +110,7 @@ pub struct AppState {
     pub time_sig_b: u32,
     pub metronome_enabled: bool,
     pub power_save_mode: bool,
+    pub lookahead_enabled: bool,
     pub selected_algo_idx: Option<usize>,
 }
 
@@ -124,6 +125,7 @@ impl Default for AppState {
             time_sig_b: 4,
             metronome_enabled: false,
             power_save_mode: false,
+            lookahead_enabled: true,
             selected_algo_idx: None,
         }
     }
@@ -170,6 +172,11 @@ pub struct MidiApp {
     // metronome: play click on each beat when enabled
     metronome_enabled: bool,
     metronome: Option<Metronome>,
+
+    // lookahead: delay automatic chord prediction slightly after new measure start
+    lookahead_enabled: bool,
+    // pending automatic chord generation: (target_measure, ready_at)
+    chord_gen_pending: Option<(u32, Instant)>,
 }
 
 impl Default for MidiApp {
@@ -212,6 +219,9 @@ impl Default for MidiApp {
             power_save_mode: false,
             metronome_enabled: true,
             metronome: None,
+
+            lookahead_enabled: true,
+            chord_gen_pending: None,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -234,6 +244,7 @@ impl MidiApp {
                 app.time_sig_b = state.time_sig_b;
                 app.metronome_enabled = state.metronome_enabled;
                 app.power_save_mode = state.power_save_mode;
+                app.lookahead_enabled = state.lookahead_enabled;
                 app.selected_algo_idx = state.selected_algo_idx;
             }
         }
@@ -374,6 +385,8 @@ impl MidiApp {
             self.recording_ended_at = Some(freeze_time);
             // prevent automatic scroll of the chord strip
             self.chord_pending_scroll_index = None;
+            // clear any pending automatic chord generation
+            self.chord_gen_pending = None;
         } else {
             self.status = "No open connection".to_string();
         }
@@ -384,6 +397,7 @@ impl MidiApp {
         self.start_time = Some(anchor);
         self.scrolling_active = true;
         self.frozen_view_end = None;
+        self.chord_gen_pending = None;
 
         // If the selected algorithm provides reset_state(), call it before clearing generated content
         if let Some(idx) = self.selected_algo_idx {
@@ -468,6 +482,7 @@ impl MidiApp {
         self.frozen_view_end = Some(freeze_time);
         self.recording_ended_at = Some(freeze_time);
         self.chord_pending_scroll_index = None;
+        self.chord_gen_pending = None;
         self.recording_enabled = false;
 
         // Update status bar with stop time
@@ -629,13 +644,23 @@ impl MidiApp {
                     let src_measure = next - 1;
                     let src_idx0 = (src_measure - 1) as f32;
                     let measure_start = src_idx0 * measure_secs;
-                    let measure_end = (src_idx0 + 1.0) * measure_secs;
+                    // lookahead: measure_end 可延长
+                    let mut measure_end = (src_idx0 + 1.0) * measure_secs;
+                    let mut lookahead_extra = 0.0f32;
+                    if self.lookahead_enabled {
+                        let lookahead = std::cmp::min(
+                            std::time::Duration::from_millis(50),
+                            std::time::Duration::from_secs_f32(beat_secs / 3.0),
+                        );
+                        lookahead_extra = lookahead.as_secs_f32() / measure_secs;
+                        measure_end += lookahead.as_secs_f32();
+                    }
 
                     for hit in &self.note_hits {
                         // convert normalized measure times to seconds relative to start_time
                         let s_elapsed = hit.start * measure_secs;
 
-                        // Exclude if note starts at/after measure end.
+                        // Exclude if note starts at/after measure end (with lookahead)
                         if s_elapsed >= measure_end {
                             continue;
                         }
@@ -653,20 +678,22 @@ impl MidiApp {
                         let s_norm = if s_elapsed <= measure_start {
                             0.0
                         } else {
-                            ((s_elapsed - measure_start) / measure_secs).clamp(0.0, 1.0)
+                            ((s_elapsed - measure_start) / measure_secs)
+                                .clamp(0.0, 1.0 + lookahead_extra)
                         };
 
-                        // Notes still active at the measure boundary => end=1.0.
+                        // Notes still active at the measure boundary => end=1.0 (或更大)
                         let e_norm = match hit.end {
                             Some(e) => {
                                 let e_elapsed = e * measure_secs;
                                 if e_elapsed >= measure_end {
-                                    1.0
+                                    1.0 + lookahead_extra
                                 } else {
-                                    ((e_elapsed - measure_start) / measure_secs).clamp(0.0, 1.0)
+                                    ((e_elapsed - measure_start) / measure_secs)
+                                        .clamp(0.0, 1.0 + lookahead_extra)
                                 }
                             }
-                            None => 1.0,
+                            None => 1.0 + lookahead_extra,
                         };
 
                         // Normalize velocity to [0,1] (MIDI velocities are 0..127)
@@ -889,6 +916,7 @@ impl MidiApp {
         self.chords
             .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
         self.save_path = Some(path.to_path_buf());
+        self.chord_gen_pending = None;
 
         Ok(())
     }
@@ -907,6 +935,7 @@ impl MidiApp {
         self.chords
             .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
         self.save_path = None;
+        self.chord_gen_pending = None;
         self.status = "New file".to_string();
     }
 
@@ -965,6 +994,7 @@ impl eframe::App for MidiApp {
             time_sig_b: self.time_sig_b,
             metronome_enabled: self.metronome_enabled,
             power_save_mode: self.power_save_mode,
+            lookahead_enabled: self.lookahead_enabled,
             selected_algo_idx: self.selected_algo_idx,
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
@@ -1166,6 +1196,8 @@ impl eframe::App for MidiApp {
                         .on_hover_text("When enabled, pause repaint when no notes are active to save CPU (default: off).");
                     ui.checkbox(&mut self.metronome_enabled, "Metronome")
                         .on_hover_text("When enabled, play a click sound on every beat of each measure (n beats per measure).");
+                    ui.checkbox(&mut self.lookahead_enabled, "Lookahead")
+                        .on_hover_text("When enabled, delay automatic chord prediction until a short lookahead time after the next measure starts (default: on). t = min(50ms, 1/3 beat)."); 
 
                 });
             });
@@ -1742,7 +1774,50 @@ impl eframe::App for MidiApp {
                             let elapsed = now.duration_since(start).as_secs_f32();
                             // Convert to 1-based measure index so the first active measure is measure 1
                             let current_measure_idx = (elapsed / measure_secs).floor() as u32 + 1;
-                            self.ensure_chords_up_to(current_measure_idx);
+
+                            if !self.lookahead_enabled {
+                                // Behave as before: immediate generation
+                                self.ensure_chords_up_to(current_measure_idx);
+                                self.chord_gen_pending = None;
+                            } else {
+                                // Lookahead enabled: delay automatic generation until t after the start of the current measure
+                                // t = min(50ms, 1/3 beat)
+                                let lookahead = std::cmp::min(
+                                    std::time::Duration::from_millis(50),
+                                    std::time::Duration::from_secs_f32(beat_secs / 3.0),
+                                );
+                                let measure_start = start
+                                    + std::time::Duration::from_secs_f32(
+                                        (current_measure_idx - 1) as f32 * measure_secs,
+                                    );
+                                let ready_at = measure_start + lookahead;
+                                if now >= ready_at {
+                                    self.ensure_chords_up_to(current_measure_idx);
+                                    self.chord_gen_pending = None;
+                                } else {
+                                    // schedule pending generation for this measure
+                                    match self.chord_gen_pending {
+                                        Some((m, t)) => {
+                                            if m < current_measure_idx || t != ready_at {
+                                                self.chord_gen_pending =
+                                                    Some((current_measure_idx, ready_at));
+                                            }
+                                        }
+                                        None => {
+                                            self.chord_gen_pending =
+                                                Some((current_measure_idx, ready_at));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // If there is a pending automatic chord generation and it's ready, run it now
+                        if let Some((target, ready_at)) = self.chord_gen_pending {
+                            if now >= ready_at {
+                                self.ensure_chords_up_to(target);
+                                self.chord_gen_pending = None;
+                            }
                         }
 
                         // draw hits as rectangles spanning start..end (or start..view_end if active)
