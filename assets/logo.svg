@@ -1,0 +1,52 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" style="background-color: transparent;">
+  <defs>
+    <style>
+      .pulse-line {
+        fill: none;
+        stroke: #E5E7EB;
+        stroke-width: 6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .node-dot {
+        fill: #E5E7EB;
+      }
+    </style>
+
+    <linearGradient id="grad-red" gradientUnits="userSpaceOnUse" x1="145" y1="100" x2="170" y2="75">
+      <stop offset="0%" style="stop-color:#E5E7EB; stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FF0000; stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="grad-green" gradientUnits="userSpaceOnUse" x1="145" y1="100" x2="180" y2="100">
+      <stop offset="0%" style="stop-color:#E5E7EB; stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00FF00; stop-opacity:1" />
+    </linearGradient>
+
+    <linearGradient id="grad-blue" gradientUnits="userSpaceOnUse" x1="145" y1="100" x2="170" y2="125">
+      <stop offset="0%" style="stop-color:#E5E7EB; stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0000FF; stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <path class="pulse-line" d="
+    M 30 100 
+    L 55 100
+    L 65 75
+    L 75 125
+    L 90 45
+    L 105 155
+    L 120 75
+    L 135 100
+    L 145 100
+  " />
+
+  <path class="pulse-line" d="M 145 100 L 170 75" style="stroke: url(#grad-red);" />
+  <path class="pulse-line" d="M 145 100 L 180 100" style="stroke: url(#grad-green);" />
+  <path class="pulse-line" d="M 145 100 L 170 125" style="stroke: url(#grad-blue);" />
+
+  <circle cx="170" cy="75" r="7" class="node-dot" style="fill: #FF0000;" />
+  <circle cx="180" cy="100" r="7" class="node-dot" style="fill: #00FF00;" />
+  <circle cx="170" cy="125" r="7" class="node-dot" style="fill: #0000FF;" />
+</svg>
