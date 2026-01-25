@@ -39,11 +39,43 @@ fn menu_item_with_shortcut(
 ) -> egui::Response {
     use egui::{Align2, FontId, TextStyle};
 
-    // Reserve a menu row that is clickable; use provided desired_width if any, otherwise fall back to a reasonable default.
+    let label_font = TextStyle::Button.resolve(ui.style());
+    let shortcut_font = if cfg!(target_os = "macos") {
+        // Use a proportional font on macOS so symbols like ⌘ and ⇧ render reliably
+        FontId::proportional(label_font.size * 0.95)
+    } else {
+        FontId::monospace(label_font.size * 0.90)
+    };
+
+    // Calculate minimum width required for content
+    let min_width = if let Some(w) = desired_width {
+        w
+    } else {
+        let label_w = ui
+            .painter()
+            .layout_no_wrap(
+                label.to_string(),
+                label_font.clone(),
+                egui::Color32::TRANSPARENT,
+            )
+            .size()
+            .x;
+        let shortcut_w = ui
+            .painter()
+            .layout_no_wrap(
+                shortcut.to_string(),
+                shortcut_font.clone(),
+                egui::Color32::TRANSPARENT,
+            )
+            .size()
+            .x;
+        // Padding between label and shortcut + margins
+        label_w + shortcut_w + 30.0
+    };
+
     let height = ui.spacing().interact_size.y.max(18.0);
-    let width = desired_width.unwrap_or_else(|| ui.available_width().min(280.0));
-    let size = egui::vec2(width, height);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // allocate_at_least will ensure we get enough space, and if the container (menu) is wider, we get that too.
+    let (rect, resp) = ui.allocate_at_least(egui::vec2(min_width, height), egui::Sense::click());
     let painter = ui.painter();
 
     // Subtle hover/active background
@@ -52,25 +84,18 @@ fn menu_item_with_shortcut(
         painter.rect_filled(rect, 0.0, fill);
     }
 
-    // Left label (normal text style)
-    let label_font = TextStyle::Button.resolve(ui.style());
+    // Left label
     painter.text(
-        rect.left_center(),
+        rect.left_center() + egui::vec2(5.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        label_font.clone(),
-        ui.style().visuals.text_color(),
+        label_font,
+        ui.style().visuals.widgets.inactive.text_color(),
     );
 
-    // Right shortcut: use proportional font on macOS so symbols like ⌘ and ⇧ render reliably, otherwise monospace.
-    let shortcut_font = if cfg!(target_os = "macos") {
-        // Use a proportional font on macOS so symbols like ⌘ and ⇧ render reliably
-        FontId::proportional(label_font.size * 0.95)
-    } else {
-        FontId::monospace(label_font.size * 0.90)
-    };
+    // Right shortcut
     painter.text(
-        rect.right_center(),
+        rect.right_center() + egui::vec2(-5.0, 0.0),
         Align2::RIGHT_CENTER,
         shortcut,
         shortcut_font,
@@ -1197,7 +1222,7 @@ impl eframe::App for MidiApp {
                     ui.checkbox(&mut self.metronome_enabled, "Metronome")
                         .on_hover_text("When enabled, play a click sound on every beat of each measure (n beats per measure).");
                     ui.checkbox(&mut self.lookahead_enabled, "Lookahead")
-                        .on_hover_text("When enabled, delay automatic chord prediction until a short lookahead time after the next measure starts (default: on). t = min(50ms, 1/3 beat)."); 
+                        .on_hover_text("When enabled, delay automatic chord prediction until a short lookahead time after the next measure starts (default: on). t = min(50ms, 1/3 beat).");
 
                 });
             });
