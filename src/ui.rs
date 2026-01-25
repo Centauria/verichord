@@ -60,15 +60,34 @@ fn menu_item_with_shortcut(
             )
             .size()
             .x;
-        let shortcut_w = ui
-            .painter()
-            .layout_no_wrap(
-                shortcut.to_string(),
-                shortcut_font.clone(),
-                egui::Color32::TRANSPARENT,
-            )
-            .size()
-            .x;
+        let shortcut_w = if shortcut.contains('⇧') {
+            let mut total = 0.0;
+            for c in shortcut.chars() {
+                if c == '⇧' {
+                    total += shortcut_font.size * 0.9;
+                } else {
+                    total += ui
+                        .painter()
+                        .layout_no_wrap(
+                            c.to_string(),
+                            shortcut_font.clone(),
+                            egui::Color32::TRANSPARENT,
+                        )
+                        .size()
+                        .x;
+                }
+            }
+            total
+        } else {
+            ui.painter()
+                .layout_no_wrap(
+                    shortcut.to_string(),
+                    shortcut_font.clone(),
+                    egui::Color32::TRANSPARENT,
+                )
+                .size()
+                .x
+        };
         // Padding between label and shortcut + margins
         label_w + shortcut_w + 30.0
     };
@@ -94,13 +113,63 @@ fn menu_item_with_shortcut(
     );
 
     // Right shortcut
-    painter.text(
-        rect.right_center() + egui::vec2(-5.0, 0.0),
-        Align2::RIGHT_CENTER,
-        shortcut,
-        shortcut_font,
-        ui.style().visuals.text_color(),
-    );
+    let text_color = ui.style().visuals.text_color();
+    if shortcut.contains('⇧') {
+        let mut x = rect.right() - 5.0;
+        let y = rect.center().y;
+
+        for c in shortcut.chars().rev() {
+            if c == '⇧' {
+                let size = shortcut_font.size;
+                let symbol_w = size * 0.9;
+                let symbol_rect = egui::Rect::from_min_size(
+                    egui::pos2(x - symbol_w, y - size / 2.0),
+                    egui::vec2(symbol_w, size),
+                );
+
+                let stroke = egui::Stroke::new(1.5, text_color);
+                let p = |u: f32, v: f32| {
+                    egui::pos2(
+                        symbol_rect.min.x + u * symbol_rect.width(),
+                        symbol_rect.min.y + v * symbol_rect.height(),
+                    )
+                };
+
+                // Draw an outlined upward arrow (Zed-style)
+                let points = vec![
+                    p(0.5, 0.15),
+                    p(0.15, 0.55),
+                    p(0.38, 0.55),
+                    p(0.38, 0.9),
+                    p(0.62, 0.9),
+                    p(0.62, 0.55),
+                    p(0.85, 0.55),
+                    p(0.5, 0.15),
+                ];
+                painter.add(egui::Shape::line(points, stroke));
+
+                x -= symbol_w;
+            } else {
+                let galley =
+                    painter.layout_no_wrap(c.to_string(), shortcut_font.clone(), text_color);
+                let w = galley.size().x;
+                painter.galley(
+                    egui::pos2(x - w, y - galley.size().y / 2.0),
+                    galley,
+                    text_color,
+                );
+                x -= w;
+            }
+        }
+    } else {
+        painter.text(
+            rect.right_center() + egui::vec2(-5.0, 0.0),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            shortcut_font,
+            text_color,
+        );
+    }
 
     resp
 }
