@@ -271,6 +271,8 @@ pub struct MidiApp {
     lookahead_enabled: bool,
     // pending automatic chord generation: (target_measure, ready_at)
     chord_gen_pending: Option<(u32, Instant)>,
+    // Last window title that was requested to the OS. Used to avoid redundant title updates.
+    last_window_title: Option<String>,
 }
 
 impl Default for MidiApp {
@@ -316,6 +318,7 @@ impl Default for MidiApp {
 
             lookahead_enabled: true,
             chord_gen_pending: None,
+            last_window_title: None,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -1096,6 +1099,29 @@ impl eframe::App for MidiApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
+
+        // Update window title to include opened file name (if any).
+        // Keep base title in sync with initial run_native title in main.rs.
+        let base_title = "VeriChord";
+        let title = if let Some(p) = &self.save_path {
+            format!(
+                "{} - {}",
+                base_title,
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    name
+                } else {
+                    p.to_str().unwrap()
+                }
+            )
+        } else {
+            base_title.to_string()
+        };
+
+        // Only send the viewport title command if it changed since last frame.
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
 
         // Manage metronome lifecycle and keep parameters in sync
         if self.metronome_enabled && self.metronome.is_none() {
