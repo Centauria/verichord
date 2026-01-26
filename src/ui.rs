@@ -193,11 +193,18 @@ pub enum ScrollMode {
     Bar,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ChordScrollDirection {
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppState {
     pub tempo_bpm: u32,
     pub scroll_mode: ScrollMode,
+    pub chords_scroll_direction: ChordScrollDirection,
     pub log_width_frac: f32,
     pub measures: u32,
     pub time_sig_a: u8,
@@ -213,6 +220,7 @@ impl Default for AppState {
         Self {
             tempo_bpm: 120,
             scroll_mode: ScrollMode::Smooth,
+            chords_scroll_direction: ChordScrollDirection::Horizontal,
             log_width_frac: 0.35,
             measures: 2,
             time_sig_a: 4,
@@ -242,6 +250,7 @@ pub struct MidiApp {
     log_width_frac: f32,
     chords: Vec<(u32, PitchOrderedSet, Duration)>,
     chords_auto_scroll: bool,
+    chords_scroll_direction: ChordScrollDirection,
     chord_pending_scroll_index: Option<usize>,
     save_path: Option<PathBuf>,
     scrolling_active: bool,
@@ -297,6 +306,7 @@ impl Default for MidiApp {
             log_width_frac: 0.35_f32,
             chords: vec![(1, PitchOrderedSet::new(), std::time::Duration::ZERO)],
             chords_auto_scroll: true,
+            chords_scroll_direction: ChordScrollDirection::Horizontal,
             chord_pending_scroll_index: None,
             save_path: None,
             scrolling_active: false,
@@ -335,6 +345,7 @@ impl MidiApp {
             if let Some(state) = eframe::get_value::<AppState>(storage, eframe::APP_KEY) {
                 app.tempo_bpm = state.tempo_bpm;
                 app.scroll_mode = state.scroll_mode;
+                app.chords_scroll_direction = state.chords_scroll_direction;
                 app.log_width_frac = state.log_width_frac;
                 app.measures = state.measures;
                 app.time_sig_a = state.time_sig_a;
@@ -1085,6 +1096,7 @@ impl eframe::App for MidiApp {
         let state = AppState {
             tempo_bpm: self.tempo_bpm,
             scroll_mode: self.scroll_mode,
+            chords_scroll_direction: self.chords_scroll_direction,
             log_width_frac: self.log_width_frac,
             measures: self.measures,
             time_sig_a: self.time_sig_a,
@@ -1386,39 +1398,47 @@ impl eframe::App for MidiApp {
                     |ui_left| {
                         ui_left.horizontal(|ui| {
                             ui.heading("MIDI Event History");
-                            // push the toggle to the right but keep it inside the available area
                             let sz: f32 = 26.0;
-                            let rem = ui.available_width();
-                            let push = (rem - sz - 6.0 - 6.0).max(0.0); // left margin 6.0, right margin 6.0
-                            ui.add_space(push);
+                            let right_margin: f32 = 6.0;
 
-                            let (rect, resp) =
-                                ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
-                            let resp = resp.on_hover_text("Auto-scroll log");
-                            // draw background indicating state
-                            let painter = ui.painter_at(rect);
-                            let bg = if self.log_auto_scroll {
-                                egui::Color32::from_rgb(60, 145, 60)
-                            } else {
-                                egui::Color32::from_rgb(70, 70, 70)
-                            };
-                            painter.rect_filled(rect, 4.0, bg);
-                            // icon
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "🔁",
-                                egui::FontId::proportional(14.0),
-                                egui::Color32::WHITE,
+                            // Right-align the auto-scroll control to keep layout consistent with other panes.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Keep a small margin from the right edge
+                                    ui.add_space(right_margin);
+
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(sz, sz),
+                                        egui::Sense::click(),
+                                    );
+                                    let resp = resp.on_hover_text("Auto-scroll log");
+                                    // draw background indicating state
+                                    let painter = ui.painter_at(rect);
+                                    let bg = if self.log_auto_scroll {
+                                        egui::Color32::from_rgb(60, 145, 60)
+                                    } else {
+                                        egui::Color32::from_rgb(70, 70, 70)
+                                    };
+                                    painter.rect_filled(rect, 4.0, bg);
+                                    // icon
+                                    painter.text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "🔁",
+                                        egui::FontId::proportional(14.0),
+                                        egui::Color32::WHITE,
+                                    );
+
+                                    if resp.clicked() {
+                                        self.log_auto_scroll = !self.log_auto_scroll;
+                                        if self.log_auto_scroll && !self.log.is_empty() {
+                                            self.log_pending_scroll = true;
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
+                                },
                             );
-
-                            if resp.clicked() {
-                                self.log_auto_scroll = !self.log_auto_scroll;
-                                if self.log_auto_scroll && !self.log.is_empty() {
-                                    self.log_pending_scroll = true;
-                                    ui.ctx().request_repaint();
-                                }
-                            }
                         });
                         ui_left.separator();
                         let log_scroll_output = egui::ScrollArea::vertical()
@@ -1502,62 +1522,89 @@ impl eframe::App for MidiApp {
                             // Circular record button to the right of the title
                             // Match chord auto-scroll sizing/margins: 26px button, 12px right margin
                             let sz: f32 = 26.0;
-                            let rem = ui_h.available_width();
                             let right_margin: f32 = 12.0;
-                            let push = (rem - (sz + right_margin)).max(0.0);
-                            ui_h.add_space(push);
 
-                            let (rect, resp) =
-                                ui_h.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
-                            let resp = resp.on_hover_text("Record (Space)");
+                            // Right-align the record button so it is consistently flush from the right edge.
+                            ui_h.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Keep a margin from the right edge
+                                    ui.add_space(right_margin);
 
-                            // determine state and colors
-                            let is_open = self.connection.is_some();
-                            let is_recording = self.start_time.is_some() && self.scrolling_active;
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(sz, sz),
+                                        egui::Sense::click(),
+                                    );
+                                    let resp = resp.on_hover_text("Record (Space)");
 
-                            let painter = ui_h.painter_at(rect);
-                            let center = rect.center();
-                            let radius = sz * 0.5;
+                                    // determine state and colors
+                                    let is_open = self.connection.is_some();
+                                    let is_recording =
+                                        self.start_time.is_some() && self.scrolling_active;
 
-                            if !is_open {
-                                // disabled gray circle
-                                painter.circle_filled(center, radius, egui::Color32::from_gray(70));
-                                painter.text(
-                                    center,
-                                    egui::Align2::CENTER_CENTER,
-                                    "●",
-                                    egui::FontId::proportional(14.0),
-                                    egui::Color32::from_gray(140),
-                                );
-                            } else if is_recording {
-                                // active: red circle with white stop square
-                                painter.circle_filled(
-                                    center,
-                                    radius,
-                                    egui::Color32::from_rgb(200, 40, 40),
-                                );
-                                let sq = sz * 0.45;
-                                let sq_rect =
-                                    egui::Rect::from_center_size(center, egui::vec2(sq, sq));
-                                painter.rect_filled(sq_rect, 3.0, egui::Color32::WHITE);
-                            } else {
-                                // armed/ready: dark red circle with white dot
-                                painter.circle_filled(
-                                    center,
-                                    radius,
-                                    egui::Color32::from_rgb(170, 50, 50),
-                                );
-                                painter.circle_filled(center, radius * 0.42, egui::Color32::WHITE);
-                            }
+                                    let painter = ui.painter_at(rect);
+                                    let center = rect.center();
+                                    let radius = sz * 0.5;
 
-                            if is_open && resp.clicked() {
-                                if is_recording {
-                                    self.stop_recording();
-                                } else {
-                                    self.start_recording(Instant::now());
-                                }
-                                ctx.request_repaint();
-                            }
+                                    if !is_open {
+                                        // disabled gray circle
+                                        painter.circle_filled(
+                                            center,
+                                            radius,
+                                            egui::Color32::from_gray(70),
+                                        );
+                                        painter.circle_filled(
+                                            center,
+                                            radius * 0.4,
+                                            egui::Color32::from_gray(140),
+                                        );
+                                    } else if is_recording {
+                                        // recording visuals: red center/outer
+                                        painter.circle_filled(
+                                            center,
+                                            radius,
+                                            egui::Color32::from_rgb(160, 40, 40),
+                                        );
+                                        painter.circle_filled(
+                                            center,
+                                            radius * 0.6,
+                                            egui::Color32::from_rgb(200, 80, 80),
+                                        );
+                                    } else {
+                                        // ready-to-record visuals: green background with triangle
+                                        painter.circle_filled(
+                                            center,
+                                            radius,
+                                            egui::Color32::from_rgb(60, 145, 60),
+                                        );
+                                        let tri = [
+                                            center + egui::vec2(-4.0, -6.0),
+                                            center + egui::vec2(8.0, 0.0),
+                                            center + egui::vec2(-4.0, 6.0),
+                                        ];
+                                        painter.add(egui::Shape::convex_polygon(
+                                            tri.to_vec(),
+                                            egui::Color32::WHITE,
+                                            egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                                        ));
+                                    }
+
+                                    if resp.clicked() {
+                                        if is_open {
+                                            if is_recording {
+                                                // stop recording
+                                                self.stop_recording();
+                                            } else {
+                                                // start recording
+                                                self.start_recording(Instant::now());
+                                                ctx.request_repaint();
+                                            }
+                                        } else {
+                                            self.open_selected(ctx);
+                                        }
+                                    }
+                                },
+                            );
                         });
 
                         ui_right.separator();
@@ -2196,97 +2243,199 @@ impl eframe::App for MidiApp {
                     }
                 }
 
-                // push the auto-scroll toggle to the far right of the header, leaving a small right margin
+                // push the controls (direction + auto-scroll) to the far right of the header, leaving a small right margin
                 let sz: f32 = 26.0;
-                let rem_after = ui.available_width();
+                let gap: f32 = 6.0;
                 let right_margin: f32 = 12.0; // px of spacing to keep from the right edge
-                let push = (rem_after - (sz + right_margin)).max(0.0);
-                ui.add_space(push);
+                // Place controls using a right-to-left layout so the rightmost control sits comfortably away from the right edge
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Keep a margin from the right edge
+                    ui.add_space(right_margin);
 
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
-                let resp = resp.on_hover_text("Auto-scroll chords");
-                // draw background indicating state
-                let painter = ui.painter_at(rect);
-                let bg = if self.chords_auto_scroll {
-                    egui::Color32::from_rgb(60, 145, 60)
-                } else {
-                    egui::Color32::from_rgb(70, 70, 70)
-                };
-                painter.rect_filled(rect, 4.0, bg);
-                // icon
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "🔁",
-                    egui::FontId::proportional(14.0),
-                    egui::Color32::WHITE,
-                );
+                    // Auto-scroll (rightmost)
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                    let resp = resp.on_hover_text("Auto-scroll chords");
+                    // draw background indicating state
+                    let painter = ui.painter_at(rect);
+                    let bg = if self.chords_auto_scroll {
+                        egui::Color32::from_rgb(60, 145, 60)
+                    } else {
+                        egui::Color32::from_rgb(70, 70, 70)
+                    };
+                    painter.rect_filled(rect, 4.0, bg);
+                    // icon
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🔁",
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        self.chords_auto_scroll = !self.chords_auto_scroll;
+                        if self.chords_auto_scroll && !self.chords.is_empty() {
+                            self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    ui.add_space(gap);
 
-                if resp.clicked() {
-                    self.chords_auto_scroll = !self.chords_auto_scroll;
-                    if self.chords_auto_scroll && !self.chords.is_empty() {
-                        self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                    // Scroll direction toggle (to the left of auto-scroll)
+                    let (dir_rect, dir_resp) =
+                        ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                    let dir_resp = dir_resp.on_hover_text(match self.chords_scroll_direction {
+                        ChordScrollDirection::Horizontal => "Scroll: Left/Right",
+                        ChordScrollDirection::Vertical => "Scroll: Up/Down",
+                    });
+                    let painter = ui.painter_at(dir_rect);
+                    let bg = egui::Color32::from_rgb(70, 70, 70);
+                    painter.rect_filled(dir_rect, 4.0, bg);
+                    let dir_icon = match self.chords_scroll_direction {
+                        ChordScrollDirection::Horizontal => "↔",
+                        ChordScrollDirection::Vertical => "↕",
+                    };
+                    painter.text(
+                        dir_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        dir_icon,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                    if dir_resp.clicked() {
+                        self.chords_scroll_direction = match self.chords_scroll_direction {
+                            ChordScrollDirection::Horizontal => ChordScrollDirection::Vertical,
+                            ChordScrollDirection::Vertical => ChordScrollDirection::Horizontal,
+                        };
+                        // if auto-scroll is on, ensure we move to the latest chord
+                        if self.chords_auto_scroll && !self.chords.is_empty() {
+                            self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                        }
                         ui.ctx().request_repaint();
                     }
-                }
+                });
             });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            let chord_scroll_output = egui::ScrollArea::horizontal()
-                .stick_to_right(self.chords_auto_scroll)
-                .max_height(card_h + 16.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut card_rects: Vec<egui::Rect> = Vec::new();
-                        for (_i, (measure, chord, dur)) in self.chords.iter().enumerate() {
-                            let (rect, _resp) = ui.allocate_exact_size(
-                                egui::vec2(card_w, card_h),
-                                egui::Sense::hover(),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(
-                                rect.shrink(4.0),
-                                6.0,
-                                egui::Color32::from_rgb(60, 60, 70),
-                            );
-                            painter.text(
-                                rect.left_top() + egui::vec2(8.0, 6.0),
-                                egui::Align2::LEFT_TOP,
-                                format!("{}.", measure),
-                                egui::FontId::monospace(10.0),
-                                egui::Color32::from_gray(200),
-                            );
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                chord.to_string(),
-                                egui::FontId::proportional(18.0),
-                                egui::Color32::WHITE,
-                            );
-                            // Draw the measured duration in bottom-right with adaptive units
-                            painter.text(
-                                rect.right_bottom() - egui::vec2(6.0, 6.0),
-                                egui::Align2::RIGHT_BOTTOM,
-                                format_duration_adaptive(*dur),
-                                egui::FontId::monospace(10.0),
-                                egui::Color32::from_gray(180),
-                            );
-                            card_rects.push(rect);
-                        }
-                        if let Some(idx) = self.chord_pending_scroll_index.take() {
-                            if idx < card_rects.len() {
-                                ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                                ui.ctx().request_repaint();
+            let chord_scroll_output =
+                if self.chords_scroll_direction == ChordScrollDirection::Horizontal {
+                    egui::ScrollArea::horizontal()
+                        .stick_to_right(self.chords_auto_scroll)
+                        .max_height(card_h + 16.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut card_rects: Vec<egui::Rect> = Vec::new();
+                                for (_i, (measure, chord, dur)) in self.chords.iter().enumerate() {
+                                    let (rect, _resp) = ui.allocate_exact_size(
+                                        egui::vec2(card_w, card_h),
+                                        egui::Sense::hover(),
+                                    );
+                                    let painter = ui.painter_at(rect);
+                                    painter.rect_filled(
+                                        rect.shrink(4.0),
+                                        6.0,
+                                        egui::Color32::from_rgb(60, 60, 70),
+                                    );
+                                    painter.text(
+                                        rect.left_top() + egui::vec2(8.0, 6.0),
+                                        egui::Align2::LEFT_TOP,
+                                        format!("{}.", measure),
+                                        egui::FontId::monospace(10.0),
+                                        egui::Color32::from_gray(200),
+                                    );
+                                    painter.text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        chord.to_string(),
+                                        egui::FontId::proportional(18.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    // Draw the measured duration in bottom-right with adaptive units
+                                    painter.text(
+                                        rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                        egui::Align2::RIGHT_BOTTOM,
+                                        format_duration_adaptive(*dur),
+                                        egui::FontId::monospace(10.0),
+                                        egui::Color32::from_gray(180),
+                                    );
+                                    card_rects.push(rect);
+                                }
+                                if let Some(idx) = self.chord_pending_scroll_index.take() {
+                                    if idx < card_rects.len() {
+                                        ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            });
+                        })
+                } else {
+                    // Vertical, wrapped layout: cards flow left->right and wrap to the next line when hitting the available width.
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(self.chords_auto_scroll)
+                        .max_height(card_h * 4.0 + 16.0)
+                        .show(ui, |ui| {
+                            let available = ui.available_width();
+                            let gap = ui.spacing().item_spacing.x;
+                            let per_row =
+                                ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
+                            let mut card_rects: Vec<egui::Rect> = Vec::new();
+                            for chunk in self.chords.chunks(per_row) {
+                                ui.horizontal(|ui| {
+                                    for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
+                                        let (rect, _resp) = ui.allocate_exact_size(
+                                            egui::vec2(card_w, card_h),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui.painter_at(rect);
+                                        painter.rect_filled(
+                                            rect.shrink(4.0),
+                                            6.0,
+                                            egui::Color32::from_rgb(60, 60, 70),
+                                        );
+                                        painter.text(
+                                            rect.left_top() + egui::vec2(8.0, 6.0),
+                                            egui::Align2::LEFT_TOP,
+                                            format!("{}.", measure),
+                                            egui::FontId::monospace(10.0),
+                                            egui::Color32::from_gray(200),
+                                        );
+                                        painter.text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            chord.to_string(),
+                                            egui::FontId::proportional(18.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        painter.text(
+                                            rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                            egui::Align2::RIGHT_BOTTOM,
+                                            format_duration_adaptive(*dur),
+                                            egui::FontId::monospace(10.0),
+                                            egui::Color32::from_gray(180),
+                                        );
+                                        card_rects.push(rect);
+                                    }
+                                });
                             }
-                        }
-                    });
-                });
+                            if let Some(idx) = self.chord_pending_scroll_index.take() {
+                                if idx < card_rects.len() {
+                                    ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        })
+                };
 
-            // Detect user manual scrolling (scrolling left) and disable auto-scroll
+            // Detect user manual scrolling and disable auto-scroll
+            let current_offset = if self.chords_scroll_direction == ChordScrollDirection::Horizontal
+            {
+                chord_scroll_output.state.offset.x
+            } else {
+                chord_scroll_output.state.offset.y
+            };
             if self.chords_auto_scroll {
-                let current_offset = chord_scroll_output.state.offset.x;
                 if let Some(last_offset) = self.last_chord_scroll_offset {
-                    // If user scrolled left (offset decreased), disable auto-scroll
+                    // If user scrolled away from the end (offset decreased), disable auto-scroll
                     if current_offset < last_offset - 1.0 {
                         self.chords_auto_scroll = false;
                     }
@@ -2294,7 +2443,7 @@ impl eframe::App for MidiApp {
                 self.last_chord_scroll_offset = Some(current_offset);
             } else {
                 // When auto-scroll is off, still track offset for when it's re-enabled
-                self.last_chord_scroll_offset = Some(chord_scroll_output.state.offset.x);
+                self.last_chord_scroll_offset = Some(current_offset);
             }
 
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
