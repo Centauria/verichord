@@ -1611,6 +1611,13 @@ impl eframe::App for MidiApp {
 
                         let (r, resp) = ui_right
                             .allocate_exact_size(egui::vec2(right_w, height), egui::Sense::drag());
+                        // Hint for users: indicate that the piano roll can be panned by dragging or using the mouse wheel
+                        let hint = if self.recording_enabled {
+                            "Panning disabled while recording"
+                        } else {
+                            "Pan timeline (drag or mouse wheel)"
+                        };
+                        let resp = resp.on_hover_text(hint);
                         let painter = ui_right.painter_at(r);
 
                         // background
@@ -1670,7 +1677,7 @@ impl eframe::App for MidiApp {
                         let measure_secs = beat_secs * beats_per_measure as f32;
                         let window_secs = measure_secs * (self.measures as f32);
 
-                        if resp.dragged() {
+                        if resp.dragged() && !self.recording_enabled {
                             let delta_x = resp.drag_delta().x;
                             // dragging right (positive) moves view window to the left (earlier time)
                             let px_per_sec = right_w / window_secs;
@@ -1702,6 +1709,8 @@ impl eframe::App for MidiApp {
                             }
                         }
 
+                        // wheel scrolling handler moved to after view_end
+
                         // Map time signature to hierarchical beats for rhythm weighting.
                         // Special-case common compound time 6/8 -> [2,3], otherwise use top-level beats = a
                         let beats_vec: Vec<i32> = if self.time_sig_a == 4 {
@@ -1715,7 +1724,9 @@ impl eframe::App for MidiApp {
                         };
 
                         // Determine view_end: if scrolling is active compute normally, otherwise freeze to `frozen_view_end` (or now)
-                        let view_end = if self.scrolling_active {
+                        // `view_end` is mutable because mouse-wheel horizontal scrolling can switch the view into
+                        // a frozen/manual mode by setting `frozen_view_end` and disabling `scrolling_active`.
+                        let mut view_end = if self.scrolling_active {
                             match self.scroll_mode {
                                 ScrollMode::Smooth => now,
                                 ScrollMode::Bar => {
@@ -1735,6 +1746,62 @@ impl eframe::App for MidiApp {
                         } else {
                             self.frozen_view_end.unwrap_or(now)
                         };
+
+                        // Handle mouse wheel horizontal scrolling while hovering the piano roll.
+                        // Use `smooth_scroll_delta` (smoothed over frames) for a nicer, less jumpy experience.
+                        // Interpret horizontal scroll (preferred) or vertical wheel as a time pan.
+                        // Disabled while recording to avoid interrupting the live recording view.
+                        if resp.hovered() && !self.recording_enabled {
+                            let scroll = ui_right.ctx().input(|i| i.smooth_scroll_delta);
+
+                            // Prefer horizontal scroll; otherwise use the vertical scroll value.
+                            let scroll_px = if scroll.x.abs() > scroll.y.abs() {
+                                scroll.x
+                            } else {
+                                scroll.y
+                            };
+                            if scroll_px.abs() > 0.0 {
+                                // Convert pixels to seconds using the same px_per_sec metric as dragging.
+                                let px_per_sec = right_w / window_secs;
+                                let dt = scroll_px / px_per_sec;
+
+                                // Base the adjustment on the current frozen view end (if any),
+                                // otherwise start from the current computed view_end.
+                                let base_fve = if let Some(fve) = self.frozen_view_end {
+                                    fve
+                                } else {
+                                    view_end
+                                };
+
+                                let mut new_fve = if dt >= 0.0 {
+                                    base_fve
+                                        .checked_sub(std::time::Duration::from_secs_f32(dt))
+                                        .unwrap_or(base_fve)
+                                } else {
+                                    base_fve + std::time::Duration::from_secs_f32(-dt)
+                                };
+
+                                // Constrain panning: don't show area before start_time (at left edge)
+                                if let Some(start) = self.start_time {
+                                    let min_view_end =
+                                        start + std::time::Duration::from_secs_f32(window_secs);
+                                    if new_fve < min_view_end {
+                                        new_fve = min_view_end;
+                                    }
+                                    let max_view_end =
+                                        self.recording_ended_at.unwrap_or_else(Instant::now);
+                                    if new_fve > max_view_end {
+                                        new_fve = max_view_end;
+                                    }
+                                }
+
+                                self.frozen_view_end = Some(new_fve);
+                                self.scrolling_active = false; // switch to manual/frozen mode
+                                // Recompute view_end to reflect the new frozen value
+                                view_end = self.frozen_view_end.unwrap_or(now);
+                                ui_right.ctx().request_repaint();
+                            }
+                        }
 
                         match self.scroll_mode {
                             ScrollMode::Smooth => {
