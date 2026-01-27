@@ -1196,8 +1196,6 @@ impl eframe::App for MidiApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let bottom_padding: f32 = 36.0; // leave space so the bottom panel doesn't cover the last line
-
             // Two independent panes with a draggable vertical splitter
             // We'll implement the splitter manually so it behaves like a normal IDE splitter.
             // Left = log, handle = draggable, Right = piano roll
@@ -1272,7 +1270,6 @@ impl eframe::App for MidiApp {
                                     let resp = ui_left.label(line);
                                     line_rects.push(resp.rect);
                                 }
-                                ui_left.add_space(bottom_padding);
 
                                 // If a forced scroll was requested (new entries while auto-scroll enabled), scroll to the last line
                                 if self.log_pending_scroll {

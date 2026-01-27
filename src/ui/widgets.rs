@@ -281,6 +281,11 @@ pub fn chord_cards_vertical(
                     }
                 });
             }
+
+            // Reserve space at the bottom so the last row can scroll above the status bar.
+            let bottom_padding = 12.0;
+            ui.add_space(bottom_padding);
+
             if let Some(idx) = chord_pending_scroll_index.take() {
                 if idx < card_rects.len() {
                     ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
