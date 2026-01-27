@@ -370,9 +370,9 @@ Usage:
   verichord-installer [--path <PATH>] [--no-build] [--install]
 
 Options:
-  --path <PATH>   Custom installation target forwarded to the app's `--create-app <PATH>`
+  --path <PATH>   Custom installation target (e.g. .app path on macOS, .desktop on Linux)
   --no-build      Skip `cargo build --release` (use existing `target/release/verichord`)
-  --install       Run `cargo install --path .` and then run installed `verichord --create-app`
+  --install       Run `cargo install --path .` and then create app from installed binary
   --help          Show this help
 "#;
 
@@ -474,11 +474,6 @@ fn create_png_from_svg<P: AsRef<std::path::Path>>(
     }
     fs::write(out_path, &png)?;
     Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn create_macos_app() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Err("macOS app creation is only supported on macOS builds".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -599,7 +594,7 @@ fn uninstall_macos_app_at(dest: Option<PathBuf>) -> Result<(), Box<dyn std::erro
 }
 
 #[cfg(not(target_os = "macos"))]
-fn uninstall_macos_app_at() -> Result<(), Box<dyn std::error::Error>> {
+fn uninstall_macos_app_at(_dest: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     Err("macOS uninstall is only supported on macOS builds".into())
 }
 
@@ -686,7 +681,7 @@ fn uninstall_windows_shortcut_at(_dest: Option<PathBuf>) -> Result<(), Box<dyn s
 /// This implements the behavior previously in the separate installer binary:
 /// - parse `--path`, `--no-build`, `--install`
 /// - optionally run `cargo install --path .` (then run the installed binary)
-/// - otherwise `cargo build --release` (unless `--no-build`) and run `target/release/verichord --create-app [path]`
+/// - otherwise `cargo build --release` (unless `--no-build`) and create platform app bundle
 pub fn run_installer(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // help
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -836,11 +831,6 @@ fn installed_binary_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 
     Err("installed binary not found in CARGO_HOME or ~/.cargo/bin".into())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn uninstall_macos_app() -> Result<(), Box<dyn std::error::Error>> {
-    Err("macOS uninstall is only supported on macOS builds".into())
 }
 
 #[cfg(target_os = "linux")]
