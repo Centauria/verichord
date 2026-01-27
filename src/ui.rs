@@ -1563,30 +1563,32 @@ impl eframe::App for MidiApp {
                                         painter.circle_filled(
                                             center,
                                             radius,
-                                            egui::Color32::from_rgb(160, 40, 40),
+                                            egui::Color32::from_rgb(120, 40, 40),
                                         );
-                                        painter.circle_filled(
-                                            center,
-                                            radius * 0.6,
+                                        let square_size = radius * 0.8;
+                                        let square_top_left = center
+                                            - egui::vec2(square_size / 2.0, square_size / 2.0);
+                                        let square_rect = egui::Rect::from_min_size(
+                                            square_top_left,
+                                            egui::vec2(square_size, square_size),
+                                        );
+                                        painter.rect_filled(
+                                            square_rect,
+                                            0.0,
                                             egui::Color32::from_rgb(200, 80, 80),
                                         );
                                     } else {
-                                        // ready-to-record visuals: green background with triangle
+                                        // ready-to-record visuals: green background with circular white center
                                         painter.circle_filled(
                                             center,
                                             radius,
                                             egui::Color32::from_rgb(60, 145, 60),
                                         );
-                                        let tri = [
-                                            center + egui::vec2(-4.0, -6.0),
-                                            center + egui::vec2(8.0, 0.0),
-                                            center + egui::vec2(-4.0, 6.0),
-                                        ];
-                                        painter.add(egui::Shape::convex_polygon(
-                                            tri.to_vec(),
+                                        painter.circle_filled(
+                                            center,
+                                            radius * 0.4,
                                             egui::Color32::WHITE,
-                                            egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
-                                        ));
+                                        );
                                     }
 
                                     if resp.clicked() {
