@@ -304,7 +304,7 @@ impl Default for MidiApp {
             start_time: None,
             measures: 2,
             log_width_frac: 0.35_f32,
-            chords: vec![(1, PitchOrderedSet::new(), std::time::Duration::ZERO)],
+            chords: Vec::new(),
             chords_auto_scroll: true,
             chords_scroll_direction: ChordScrollDirection::Horizontal,
             chord_pending_scroll_index: None,
@@ -439,8 +439,6 @@ impl MidiApp {
                     self.log.clear();
                     self.note_hits.clear();
                     self.chords.clear();
-                    self.chords
-                        .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
                     self.chord_pending_scroll_index = None;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
@@ -532,8 +530,6 @@ impl MidiApp {
 
         // Clear old generated content so re-recording starts fresh
         self.chords.clear();
-        self.chords
-            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
         self.chord_pending_scroll_index = None;
         // Clear prior MIDI hits and event log to avoid showing previous recordings
         self.note_hits.clear();
@@ -623,11 +619,7 @@ impl MidiApp {
                                 self.scrolling_active = true;
                                 self.frozen_view_end = None;
                                 self.chords.clear();
-                                self.chords.push((
-                                    1,
-                                    PitchOrderedSet::new(),
-                                    std::time::Duration::ZERO,
-                                ));
+                                self.chord_pending_scroll_index = None;
 
                                 // If the user has enabled the metronome in settings, start or enable it now
                                 if self.metronome_enabled {
@@ -716,10 +708,10 @@ impl MidiApp {
     }
 
     fn ensure_chords_up_to(&mut self, up_to: u32) {
-        // `self.chords` stores predicted chords per measure (1-based).
-        // The initial chord is treated as measure 1. At the end of measure n,
-        // we summarize notes in measure n and generate the chord for measure n+1.
-        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(2);
+        // `self.chords` stores predicted chords per measure (0-based).
+        // No chord is present initially. At the end of measure n, we summarize notes in measure n
+        // and generate the chord for measure n+1 (e.g. after measure 0 ends we will generate chord for measure 1).
+        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(1);
         while next <= up_to {
             // Prefer the explicit capability check so we don't rely only on raw fn pointers.
             // This also makes use of `has_sample_next_chord()` so the helper is exercised.
@@ -748,11 +740,11 @@ impl MidiApp {
                     let beats_per_measure: usize = self.time_sig_a as usize;
                     let measure_secs = beat_secs * beats_per_measure as f32;
                     // We are predicting chord for measure `next` using notes from measure `src_measure`.
-                    // Measures are 1-based: measure 1 starts at t=0.
-                    let src_measure = next - 1;
-                    let src_idx0 = (src_measure - 1) as f32;
+                    // Measures are 0-based: measure 0 starts at t=0.
+                    let src_measure = next.saturating_sub(1);
+                    let src_idx0 = src_measure as f32;
                     let measure_start = src_idx0 * measure_secs;
-                    // lookahead: measure_end 可延长
+                    // lookahead: measure_end may be extended
                     let mut measure_end = (src_idx0 + 1.0) * measure_secs;
                     let mut lookahead_extra = 0.0f32;
                     if self.lookahead_enabled {
@@ -881,7 +873,10 @@ impl MidiApp {
         let mut file = File::create(path).map_err(|e| e.to_string())?;
 
         // Write metadata header lines (prefixed with '#')
-        let header = format!("# sig: {}/{}\n", self.time_sig_a, self.time_sig_b);
+        let header = format!(
+            "# sig: {}/{}\n# pos: 0-based\n",
+            self.time_sig_a, self.time_sig_b
+        );
         file.write_all(header.as_bytes())
             .map_err(|e| e.to_string())?;
 
@@ -903,14 +898,14 @@ impl MidiApp {
             let s_measure_idx = (s_elapsed / measure_secs).floor() as i64;
             let s_in_measure = ((s_elapsed - (s_measure_idx as f32) * measure_secs) / measure_secs)
                 .clamp(0.0_f32, 1.0_f32);
-            // measures are 1-based
-            let s_pos = (s_measure_idx as f64) + s_in_measure as f64 + 1.0;
+            // measures are 0-based now
+            let s_pos = (s_measure_idx as f64) + s_in_measure as f64;
 
             let e_elapsed = hit_end_secs;
             let e_measure_idx = (e_elapsed / measure_secs).floor() as i64;
             let e_in_measure = ((e_elapsed - (e_measure_idx as f32) * measure_secs) / measure_secs)
                 .clamp(0.0_f32, 1.0_f32);
-            let e_pos = (e_measure_idx as f64) + e_in_measure as f64 + 1.0;
+            let e_pos = (e_measure_idx as f64) + e_in_measure as f64;
 
             let velocity = hit.velocity;
 
@@ -930,6 +925,7 @@ impl MidiApp {
         let mut sig_b = self.time_sig_b;
 
         // First pass: parse header lines only
+        let mut header_pos_offset: Option<f32> = None; // Some(0.0) or Some(1.0) if header specifies
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -953,6 +949,14 @@ impl MidiApp {
                         sig_b = b;
                     }
                 }
+                if let Some(poshdr) = rest.strip_prefix("pos:") {
+                    let poshdr = poshdr.trim();
+                    if poshdr.starts_with('0') {
+                        header_pos_offset = Some(0.0_f32);
+                    } else if poshdr.starts_with('1') {
+                        header_pos_offset = Some(1.0_f32);
+                    }
+                }
             }
         }
 
@@ -966,8 +970,7 @@ impl MidiApp {
         let measure_secs = beat_secs * (self.time_sig_a as f32);
 
         let start_anchor = Instant::now();
-        let mut hits: Vec<crate::midi::NoteHit> = Vec::new();
-        let mut max_end_secs: f32 = 0.0;
+        let mut parsed_rows: Vec<(u8, f64, f64, u8)> = Vec::new();
 
         for (lineno, line) in content.lines().enumerate() {
             let line = line.trim();
@@ -994,15 +997,40 @@ impl MidiApp {
                 .parse()
                 .map_err(|e| format!("Invalid velocity on line {}: {}", lineno + 1, e))?;
 
+            parsed_rows.push((pitch, s_pos, e_pos, velocity));
+        }
+
+        // Determine whether file uses 0-based or 1-based positions. Preference: explicit header, otherwise auto-detect by min position.
+        let mut min_pos: f64 = std::f64::INFINITY;
+        for (_p, s_pos, e_pos, _v) in &parsed_rows {
+            if *s_pos < min_pos {
+                min_pos = *s_pos;
+            }
+            if *e_pos < min_pos {
+                min_pos = *e_pos;
+            }
+        }
+        let offset = if let Some(h) = header_pos_offset {
+            h
+        } else if min_pos >= 1.0 {
+            1.0_f32
+        } else {
+            0.0_f32
+        };
+
+        let mut hits: Vec<crate::midi::NoteHit> = Vec::new();
+        let mut max_end_secs: f32 = 0.0;
+
+        for (pitch, s_pos, e_pos, velocity) in parsed_rows {
             // convert measure-based positions to seconds relative to start_anchor
-            let e_sec = ((e_pos - 1.0) as f32) * measure_secs;
+            let e_sec = ((e_pos as f32 - offset) as f32) * measure_secs;
             if e_sec > max_end_secs {
                 max_end_secs = e_sec;
             }
 
-            // store normalized measure positions (1 measure == 1.0)
-            let start_meas = (s_pos - 1.0) as f32;
-            let end_meas = (e_pos - 1.0) as f32;
+            // store normalized measure positions (1 measure == 1.0) using 0-based positions
+            let start_meas = s_pos as f32 - offset;
+            let end_meas = e_pos as f32 - offset;
 
             hits.push(crate::midi::NoteHit {
                 pitch,
@@ -1021,8 +1049,6 @@ impl MidiApp {
         self.frozen_view_end = Some(frozen_end);
         self.recording_ended_at = Some(frozen_end);
         self.chords.clear();
-        self.chords
-            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
         self.save_path = Some(path.to_path_buf());
         self.chord_gen_pending = None;
 
@@ -1040,8 +1066,6 @@ impl MidiApp {
         self.frozen_view_end = None;
         self.recording_ended_at = None;
         self.chords.clear();
-        self.chords
-            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
         self.save_path = None;
         self.chord_gen_pending = None;
         self.status = "New file".to_string();
@@ -1839,10 +1863,9 @@ impl eframe::App for MidiApp {
                                                 ),
                                             );
 
-                                            // measure number relative to start_time (1-indexed)
-                                            let measure_num = (beat_idx as isize
-                                                / beats_per_measure as isize)
-                                                + 1;
+                                            // measure number relative to start_time (0-indexed)
+                                            let measure_num =
+                                                beat_idx as isize / beats_per_measure as isize;
                                             painter.text(
                                                 egui::pos2(x + 4.0, grid_top - 16.0),
                                                 egui::Align2::LEFT_TOP,
@@ -1881,7 +1904,7 @@ impl eframe::App for MidiApp {
                                                 ),
                                             );
 
-                                            let measure_num = b / beats_per_measure + 1;
+                                            let measure_num = b / beats_per_measure; // 0-indexed
                                             painter.text(
                                                 egui::pos2(x + 4.0, grid_top - 16.0),
                                                 egui::Align2::LEFT_TOP,
@@ -1935,9 +1958,8 @@ impl eframe::App for MidiApp {
                                                 ),
                                             );
 
-                                            let measure_num = (beat_idx as isize
-                                                / beats_per_measure as isize)
-                                                + 1;
+                                            let measure_num =
+                                                beat_idx as isize / beats_per_measure as isize; // 0-indexed
                                             painter.text(
                                                 egui::pos2(x + 4.0, grid_top - 16.0),
                                                 egui::Align2::LEFT_TOP,
@@ -1976,7 +1998,7 @@ impl eframe::App for MidiApp {
                                                 ),
                                             );
 
-                                            let measure_num = b / beats_per_measure + 1;
+                                            let measure_num = b / beats_per_measure; // 0-indexed
                                             painter.text(
                                                 egui::pos2(x + 4.0, grid_top - 16.0),
                                                 egui::Align2::LEFT_TOP,
@@ -2009,7 +2031,7 @@ impl eframe::App for MidiApp {
                             // both measure 1 and 2 at the same time. Using `now` avoids that.
                             let elapsed = now.duration_since(start).as_secs_f32();
                             // Convert to 1-based measure index so the first active measure is measure 1
-                            let current_measure_idx = (elapsed / measure_secs).floor() as u32 + 1;
+                            let current_measure_idx = (elapsed / measure_secs).floor() as u32;
 
                             if !self.lookahead_enabled {
                                 // Behave as before: immediate generation
@@ -2024,7 +2046,7 @@ impl eframe::App for MidiApp {
                                 );
                                 let measure_start = start
                                     + std::time::Duration::from_secs_f32(
-                                        (current_measure_idx - 1) as f32 * measure_secs,
+                                        current_measure_idx as f32 * measure_secs,
                                     );
                                 let ready_at = measure_start + lookahead;
                                 if now >= ready_at {
@@ -2249,10 +2271,8 @@ impl eframe::App for MidiApp {
                             }
                         }
 
-                        // Reset chords to initial state
+                        // Reset chords to initial state (no predicted chords until measures pass)
                         self.chords.clear();
-                        self.chords
-                            .push((1, PitchOrderedSet::new(), std::time::Duration::ZERO));
 
                         // Compute anchor start/end similar to save_piano_to_file
                         let quarter_secs = 60.0 / (self.tempo_bpm as f32);
@@ -2301,8 +2321,8 @@ impl eframe::App for MidiApp {
 
                         // We want to generate chords at each measure end; ensure_chords_up_to expects a target measure index
                         // and generates chords up to that measure. Since chord for measure (n+1) is generated from notes in measure n,
-                        // to produce chords for ends of measures 1..measures_present we call up_to = measures_present + 1
-                        let target = measures_present.saturating_add(1);
+                        // To produce chords corresponding to notes in measures 0..(measures_present-1), call up_to = measures_present
+                        let target = measures_present;
 
                         // Generate
                         self.ensure_chords_up_to(target);
