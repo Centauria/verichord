@@ -19,7 +19,6 @@ mod helpers;
 mod state;
 mod widgets;
 
-use crate::ui::helpers::format_duration_adaptive;
 use crate::ui::state::{AppState, ChordScrollDirection, ScrollMode};
 use crate::ui::widgets::ButtonWithShortcut;
 
@@ -2222,146 +2221,30 @@ impl eframe::App for MidiApp {
             });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            let chord_scroll_output = if self.chords_scroll_direction
-                == ChordScrollDirection::Horizontal
+            let current_offset = if self.chords_scroll_direction == ChordScrollDirection::Horizontal
             {
-                egui::ScrollArea::horizontal()
-                    .stick_to_right(self.chords_auto_scroll)
-                    .max_height(card_h + 16.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Build display list which optionally includes an initial N.C. card at measure 0
-                            let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> =
-                                Vec::new();
-                            if self.show_initial_chord {
-                                display_chords.push((
-                                    0,
-                                    PitchOrderedSet::new(),
-                                    std::time::Duration::ZERO,
-                                ));
-                            }
-                            display_chords.extend(self.chords.iter().cloned());
-
-                            let mut card_rects: Vec<egui::Rect> = Vec::new();
-                            for (_i, (measure, chord, dur)) in display_chords.iter().enumerate() {
-                                let (rect, _resp) = ui.allocate_exact_size(
-                                    egui::vec2(card_w, card_h),
-                                    egui::Sense::hover(),
-                                );
-                                let painter = ui.painter_at(rect);
-                                painter.rect_filled(
-                                    rect.shrink(4.0),
-                                    6.0,
-                                    egui::Color32::from_rgb(60, 60, 70),
-                                );
-                                painter.text(
-                                    rect.left_top() + egui::vec2(8.0, 6.0),
-                                    egui::Align2::LEFT_TOP,
-                                    format!("{}.", measure),
-                                    egui::FontId::monospace(10.0),
-                                    egui::Color32::from_gray(200),
-                                );
-                                painter.text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    chord.to_string(),
-                                    egui::FontId::proportional(18.0),
-                                    egui::Color32::WHITE,
-                                );
-                                // Draw the measured duration in bottom-right with adaptive units
-                                painter.text(
-                                    rect.right_bottom() - egui::vec2(6.0, 6.0),
-                                    egui::Align2::RIGHT_BOTTOM,
-                                    format_duration_adaptive(*dur),
-                                    egui::FontId::monospace(10.0),
-                                    egui::Color32::from_gray(180),
-                                );
-                                card_rects.push(rect);
-                            }
-                            if let Some(idx) = self.chord_pending_scroll_index.take() {
-                                if idx < card_rects.len() {
-                                    ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                        });
-                    })
+                crate::ui::widgets::chord_cards_horizontal(
+                    ui,
+                    &self.chords,
+                    self.show_initial_chord,
+                    card_w,
+                    card_h,
+                    self.chords_auto_scroll,
+                    &mut self.chord_pending_scroll_index,
+                )
             } else {
-                // Vertical, wrapped layout: cards flow left->right and wrap to the next line when hitting the available width.
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(self.chords_auto_scroll)
-                    .max_height(card_h * 4.0 + 16.0)
-                    .show(ui, |ui| {
-                        let available = ui.available_width();
-                        let gap = ui.spacing().item_spacing.x;
-                        let per_row =
-                            ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
-                        let mut card_rects: Vec<egui::Rect> = Vec::new();
-                        // Build display list which optionally includes an initial N.C. card at measure 0
-                        let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
-                        if self.show_initial_chord {
-                            display_chords.push((
-                                0,
-                                PitchOrderedSet::new(),
-                                std::time::Duration::ZERO,
-                            ));
-                        }
-                        display_chords.extend(self.chords.iter().cloned());
-
-                        for chunk in display_chords.chunks(per_row) {
-                            ui.horizontal(|ui| {
-                                for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(card_w, card_h),
-                                        egui::Sense::hover(),
-                                    );
-                                    let painter = ui.painter_at(rect);
-                                    painter.rect_filled(
-                                        rect.shrink(4.0),
-                                        6.0,
-                                        egui::Color32::from_rgb(60, 60, 70),
-                                    );
-                                    painter.text(
-                                        rect.left_top() + egui::vec2(8.0, 6.0),
-                                        egui::Align2::LEFT_TOP,
-                                        format!("{}.", measure),
-                                        egui::FontId::monospace(10.0),
-                                        egui::Color32::from_gray(200),
-                                    );
-                                    painter.text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        chord.to_string(),
-                                        egui::FontId::proportional(18.0),
-                                        egui::Color32::WHITE,
-                                    );
-                                    painter.text(
-                                        rect.right_bottom() - egui::vec2(6.0, 6.0),
-                                        egui::Align2::RIGHT_BOTTOM,
-                                        format_duration_adaptive(*dur),
-                                        egui::FontId::monospace(10.0),
-                                        egui::Color32::from_gray(180),
-                                    );
-                                    card_rects.push(rect);
-                                }
-                            });
-                        }
-                        if let Some(idx) = self.chord_pending_scroll_index.take() {
-                            if idx < card_rects.len() {
-                                ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                                ui.ctx().request_repaint();
-                            }
-                        }
-                    })
+                crate::ui::widgets::chord_cards_vertical(
+                    ui,
+                    &self.chords,
+                    self.show_initial_chord,
+                    card_w,
+                    card_h,
+                    self.chords_auto_scroll,
+                    &mut self.chord_pending_scroll_index,
+                )
             };
 
             // Detect user manual scrolling and disable auto-scroll
-            let current_offset = if self.chords_scroll_direction == ChordScrollDirection::Horizontal
-            {
-                chord_scroll_output.state.offset.x
-            } else {
-                chord_scroll_output.state.offset.y
-            };
             if self.chords_auto_scroll {
                 if let Some(last_offset) = self.last_chord_scroll_offset {
                     // If user scrolled away from the end (offset decreased), disable auto-scroll

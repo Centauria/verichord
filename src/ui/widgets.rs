@@ -1,5 +1,8 @@
 use eframe::egui::{self, Align2, FontId, TextStyle};
 
+use crate::chord::PitchOrderedSet;
+use std::time::Duration;
+
 /// Render a menu row that includes a right-aligned, monospace shortcut hint.
 /// Returns the `Response` for the whole row so callers can call `.clicked()` etc.
 pub fn menu_item_with_shortcut(
@@ -151,4 +154,139 @@ impl ButtonWithShortcut for egui::Ui {
         // Reuse the existing helper so both approaches stay visually consistent.
         menu_item_with_shortcut(self, label, shortcut, None)
     }
+}
+
+/// Render chord cards in a horizontal scroll area. Accepts the owned chord list from the caller,
+/// optionally inserts an initial N.C. card at measure 0, and handles auto-scroll/pending scroll.
+pub fn chord_cards_horizontal(
+    ui: &mut egui::Ui,
+    chords: &[(u32, PitchOrderedSet, Duration)],
+    show_initial: bool,
+    card_w: f32,
+    card_h: f32,
+    auto_scroll: bool,
+    chord_pending_scroll_index: &mut Option<usize>,
+) -> f32 {
+    let out = egui::ScrollArea::horizontal()
+        .stick_to_right(auto_scroll)
+        .max_height(card_h + 16.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Build display list which optionally includes an initial N.C. card at measure 0
+                let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
+                if show_initial {
+                    display_chords.push((0, PitchOrderedSet::new(), Duration::ZERO));
+                }
+                display_chords.extend(chords.iter().cloned());
+
+                let mut card_rects: Vec<egui::Rect> = Vec::new();
+                for (_i, (measure, chord, dur)) in display_chords.iter().enumerate() {
+                    let (rect, _resp) =
+                        ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::hover());
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect.shrink(4.0), 6.0, egui::Color32::from_rgb(60, 60, 70));
+                    painter.text(
+                        rect.left_top() + egui::vec2(8.0, 6.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{}.", measure),
+                        egui::FontId::monospace(10.0),
+                        egui::Color32::from_gray(200),
+                    );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        chord.to_string(),
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::WHITE,
+                    );
+                    // Draw the measured duration in bottom-right with adaptive units
+                    painter.text(
+                        rect.right_bottom() - egui::vec2(6.0, 6.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        crate::ui::helpers::format_duration_adaptive(*dur),
+                        egui::FontId::monospace(10.0),
+                        egui::Color32::from_gray(180),
+                    );
+                    card_rects.push(rect);
+                }
+                if let Some(idx) = chord_pending_scroll_index.take() {
+                    if idx < card_rects.len() {
+                        ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                        ui.ctx().request_repaint();
+                    }
+                }
+            });
+        });
+    out.state.offset.x
+}
+
+/// Render chord cards in a wrapped vertical layout inside a vertical scroll area.
+pub fn chord_cards_vertical(
+    ui: &mut egui::Ui,
+    chords: &[(u32, PitchOrderedSet, Duration)],
+    show_initial: bool,
+    card_w: f32,
+    card_h: f32,
+    auto_scroll: bool,
+    chord_pending_scroll_index: &mut Option<usize>,
+) -> f32 {
+    let out = egui::ScrollArea::vertical()
+        .stick_to_bottom(auto_scroll)
+        .max_height(card_h * 4.0 + 16.0)
+        .show(ui, |ui| {
+            let available = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let per_row = ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
+            let mut card_rects: Vec<egui::Rect> = Vec::new();
+            // Build display list which optionally includes an initial N.C. card at measure 0
+            let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
+            if show_initial {
+                display_chords.push((0, PitchOrderedSet::new(), Duration::ZERO));
+            }
+            display_chords.extend(chords.iter().cloned());
+
+            for chunk in display_chords.chunks(per_row) {
+                ui.horizontal(|ui| {
+                    for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
+                        let (rect, _resp) = ui
+                            .allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::hover());
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(
+                            rect.shrink(4.0),
+                            6.0,
+                            egui::Color32::from_rgb(60, 60, 70),
+                        );
+                        painter.text(
+                            rect.left_top() + egui::vec2(8.0, 6.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{}.", measure),
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_gray(200),
+                        );
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            chord.to_string(),
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::WHITE,
+                        );
+                        painter.text(
+                            rect.right_bottom() - egui::vec2(6.0, 6.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            crate::ui::helpers::format_duration_adaptive(*dur),
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_gray(180),
+                        );
+                        card_rects.push(rect);
+                    }
+                });
+            }
+            if let Some(idx) = chord_pending_scroll_index.take() {
+                if idx < card_rects.len() {
+                    ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                    ui.ctx().request_repaint();
+                }
+            }
+        });
+    out.state.offset.y
 }
