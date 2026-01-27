@@ -213,6 +213,8 @@ pub struct AppState {
     pub power_save_mode: bool,
     pub lookahead_enabled: bool,
     pub selected_algo_idx: Option<usize>,
+    /// When true, show an initial N.C. chord card at measure 0
+    pub show_initial_chord: bool,
 }
 
 impl Default for AppState {
@@ -229,6 +231,7 @@ impl Default for AppState {
             power_save_mode: false,
             lookahead_enabled: true,
             selected_algo_idx: None,
+            show_initial_chord: true,
         }
     }
 }
@@ -280,6 +283,8 @@ pub struct MidiApp {
     lookahead_enabled: bool,
     // pending automatic chord generation: (target_measure, ready_at)
     chord_gen_pending: Option<(u32, Instant)>,
+    // When true, display an initial N.C. chord card at measure 0
+    show_initial_chord: bool,
     // Last window title that was requested to the OS. Used to avoid redundant title updates.
     last_window_title: Option<String>,
 }
@@ -328,6 +333,7 @@ impl Default for MidiApp {
 
             lookahead_enabled: true,
             chord_gen_pending: None,
+            show_initial_chord: false,
             last_window_title: None,
         };
         app.midi_in.ignore(Ignore::None);
@@ -354,6 +360,7 @@ impl MidiApp {
                 app.power_save_mode = state.power_save_mode;
                 app.lookahead_enabled = state.lookahead_enabled;
                 app.selected_algo_idx = state.selected_algo_idx;
+                app.show_initial_chord = state.show_initial_chord;
             }
         }
 
@@ -834,7 +841,9 @@ impl MidiApp {
             );
             self.chords.push((next, chord, elapsed));
             if self.chords_auto_scroll {
-                self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                // scroll to newly-added chord; account for optional initial card at index 0
+                self.chord_pending_scroll_index =
+                    Some(self.chords.len() - 1 + if self.show_initial_chord { 1 } else { 0 });
             }
             next += 1;
         }
@@ -1129,6 +1138,7 @@ impl eframe::App for MidiApp {
             power_save_mode: self.power_save_mode,
             lookahead_enabled: self.lookahead_enabled,
             selected_algo_idx: self.selected_algo_idx,
+            show_initial_chord: self.show_initial_chord,
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -1354,6 +1364,8 @@ impl eframe::App for MidiApp {
                         .on_hover_text("When enabled, play a click sound on every beat of each measure (n beats per measure).");
                     ui.checkbox(&mut self.lookahead_enabled, "Lookahead")
                         .on_hover_text("When enabled, delay automatic chord prediction until a short lookahead time after the next measure starts (default: on). t = min(50ms, 1/3 beat).");
+                    ui.checkbox(&mut self.show_initial_chord, "Show initial chord")
+                        .on_hover_text("When checked, show an initial N.C. card at measure 0 before any generated chords.");
 
                 });
             });
@@ -2363,9 +2375,19 @@ impl eframe::App for MidiApp {
                     );
                     if resp.clicked() {
                         self.chords_auto_scroll = !self.chords_auto_scroll;
-                        if self.chords_auto_scroll && !self.chords.is_empty() {
-                            self.chord_pending_scroll_index = Some(self.chords.len() - 1);
-                            ui.ctx().request_repaint();
+                        if self.chords_auto_scroll {
+                            if !self.chords.is_empty() {
+                                // latest chord index in display (account for optional initial card)
+                                self.chord_pending_scroll_index = Some(
+                                    self.chords.len() - 1
+                                        + if self.show_initial_chord { 1 } else { 0 },
+                                );
+                                ui.ctx().request_repaint();
+                            } else if self.show_initial_chord {
+                                // No generated chords yet: scroll to the initial N.C. card
+                                self.chord_pending_scroll_index = Some(0);
+                                ui.ctx().request_repaint();
+                            }
                         }
                     }
                     ui.add_space(gap);
@@ -2396,9 +2418,16 @@ impl eframe::App for MidiApp {
                             ChordScrollDirection::Horizontal => ChordScrollDirection::Vertical,
                             ChordScrollDirection::Vertical => ChordScrollDirection::Horizontal,
                         };
-                        // if auto-scroll is on, ensure we move to the latest chord
-                        if self.chords_auto_scroll && !self.chords.is_empty() {
-                            self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                        // if auto-scroll is on, ensure we move to the latest chord (or initial card if no chords)
+                        if self.chords_auto_scroll {
+                            if !self.chords.is_empty() {
+                                self.chord_pending_scroll_index = Some(
+                                    self.chords.len() - 1
+                                        + if self.show_initial_chord { 1 } else { 0 },
+                                );
+                            } else if self.show_initial_chord {
+                                self.chord_pending_scroll_index = Some(0);
+                            }
                         }
                         ui.ctx().request_repaint();
                     }
@@ -2406,15 +2435,95 @@ impl eframe::App for MidiApp {
             });
             let card_h: f32 = 72.0;
             let card_w: f32 = 140.0;
-            let chord_scroll_output =
-                if self.chords_scroll_direction == ChordScrollDirection::Horizontal {
-                    egui::ScrollArea::horizontal()
-                        .stick_to_right(self.chords_auto_scroll)
-                        .max_height(card_h + 16.0)
-                        .show(ui, |ui| {
+            let chord_scroll_output = if self.chords_scroll_direction
+                == ChordScrollDirection::Horizontal
+            {
+                egui::ScrollArea::horizontal()
+                    .stick_to_right(self.chords_auto_scroll)
+                    .max_height(card_h + 16.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Build display list which optionally includes an initial N.C. card at measure 0
+                            let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> =
+                                Vec::new();
+                            if self.show_initial_chord {
+                                display_chords.push((
+                                    0,
+                                    PitchOrderedSet::new(),
+                                    std::time::Duration::ZERO,
+                                ));
+                            }
+                            display_chords.extend(self.chords.iter().cloned());
+
+                            let mut card_rects: Vec<egui::Rect> = Vec::new();
+                            for (_i, (measure, chord, dur)) in display_chords.iter().enumerate() {
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    egui::vec2(card_w, card_h),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter_at(rect);
+                                painter.rect_filled(
+                                    rect.shrink(4.0),
+                                    6.0,
+                                    egui::Color32::from_rgb(60, 60, 70),
+                                );
+                                painter.text(
+                                    rect.left_top() + egui::vec2(8.0, 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{}.", measure),
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_gray(200),
+                                );
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    chord.to_string(),
+                                    egui::FontId::proportional(18.0),
+                                    egui::Color32::WHITE,
+                                );
+                                // Draw the measured duration in bottom-right with adaptive units
+                                painter.text(
+                                    rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                    egui::Align2::RIGHT_BOTTOM,
+                                    format_duration_adaptive(*dur),
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_gray(180),
+                                );
+                                card_rects.push(rect);
+                            }
+                            if let Some(idx) = self.chord_pending_scroll_index.take() {
+                                if idx < card_rects.len() {
+                                    ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
+                    })
+            } else {
+                // Vertical, wrapped layout: cards flow left->right and wrap to the next line when hitting the available width.
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(self.chords_auto_scroll)
+                    .max_height(card_h * 4.0 + 16.0)
+                    .show(ui, |ui| {
+                        let available = ui.available_width();
+                        let gap = ui.spacing().item_spacing.x;
+                        let per_row =
+                            ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
+                        let mut card_rects: Vec<egui::Rect> = Vec::new();
+                        // Build display list which optionally includes an initial N.C. card at measure 0
+                        let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
+                        if self.show_initial_chord {
+                            display_chords.push((
+                                0,
+                                PitchOrderedSet::new(),
+                                std::time::Duration::ZERO,
+                            ));
+                        }
+                        display_chords.extend(self.chords.iter().cloned());
+
+                        for chunk in display_chords.chunks(per_row) {
                             ui.horizontal(|ui| {
-                                let mut card_rects: Vec<egui::Rect> = Vec::new();
-                                for (_i, (measure, chord, dur)) in self.chords.iter().enumerate() {
+                                for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
                                     let (rect, _resp) = ui.allocate_exact_size(
                                         egui::vec2(card_w, card_h),
                                         egui::Sense::hover(),
@@ -2439,7 +2548,6 @@ impl eframe::App for MidiApp {
                                         egui::FontId::proportional(18.0),
                                         egui::Color32::WHITE,
                                     );
-                                    // Draw the measured duration in bottom-right with adaptive units
                                     painter.text(
                                         rect.right_bottom() - egui::vec2(6.0, 6.0),
                                         egui::Align2::RIGHT_BOTTOM,
@@ -2449,71 +2557,16 @@ impl eframe::App for MidiApp {
                                     );
                                     card_rects.push(rect);
                                 }
-                                if let Some(idx) = self.chord_pending_scroll_index.take() {
-                                    if idx < card_rects.len() {
-                                        ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                                        ui.ctx().request_repaint();
-                                    }
-                                }
                             });
-                        })
-                } else {
-                    // Vertical, wrapped layout: cards flow left->right and wrap to the next line when hitting the available width.
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(self.chords_auto_scroll)
-                        .max_height(card_h * 4.0 + 16.0)
-                        .show(ui, |ui| {
-                            let available = ui.available_width();
-                            let gap = ui.spacing().item_spacing.x;
-                            let per_row =
-                                ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
-                            let mut card_rects: Vec<egui::Rect> = Vec::new();
-                            for chunk in self.chords.chunks(per_row) {
-                                ui.horizontal(|ui| {
-                                    for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
-                                        let (rect, _resp) = ui.allocate_exact_size(
-                                            egui::vec2(card_w, card_h),
-                                            egui::Sense::hover(),
-                                        );
-                                        let painter = ui.painter_at(rect);
-                                        painter.rect_filled(
-                                            rect.shrink(4.0),
-                                            6.0,
-                                            egui::Color32::from_rgb(60, 60, 70),
-                                        );
-                                        painter.text(
-                                            rect.left_top() + egui::vec2(8.0, 6.0),
-                                            egui::Align2::LEFT_TOP,
-                                            format!("{}.", measure),
-                                            egui::FontId::monospace(10.0),
-                                            egui::Color32::from_gray(200),
-                                        );
-                                        painter.text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            chord.to_string(),
-                                            egui::FontId::proportional(18.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                        painter.text(
-                                            rect.right_bottom() - egui::vec2(6.0, 6.0),
-                                            egui::Align2::RIGHT_BOTTOM,
-                                            format_duration_adaptive(*dur),
-                                            egui::FontId::monospace(10.0),
-                                            egui::Color32::from_gray(180),
-                                        );
-                                        card_rects.push(rect);
-                                    }
-                                });
+                        }
+                        if let Some(idx) = self.chord_pending_scroll_index.take() {
+                            if idx < card_rects.len() {
+                                ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
+                                ui.ctx().request_repaint();
                             }
-                            if let Some(idx) = self.chord_pending_scroll_index.take() {
-                                if idx < card_rects.len() {
-                                    ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                        })
-                };
+                        }
+                    })
+            };
 
             // Detect user manual scrolling and disable auto-scroll
             let current_offset = if self.chords_scroll_direction == ChordScrollDirection::Horizontal
