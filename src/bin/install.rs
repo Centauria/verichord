@@ -1,4 +1,5 @@
 use std::env;
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufWriter, Cursor};
 use std::path::PathBuf;
@@ -6,6 +7,12 @@ use std::process::{Command, Stdio};
 
 use resvg::tiny_skia;
 use resvg::usvg;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    // Delegate to the shared installer implementation in the install module
+    run_installer(&args)
+}
 
 /// Create an app, optionally installing to `dest`:
 /// - macOS: `dest` may be an absolute `.app` bundle path or a directory (the `.app` will be created
@@ -362,7 +369,7 @@ pub fn create_app_from_exe(
     }
 }
 
-const LOGO_SVG: &[u8] = include_bytes!("../assets/logo.svg");
+const LOGO_SVG: &[u8] = include_bytes!("../../assets/logo.svg");
 
 const INSTALLER_USAGE: &str = r#"verichord-installer
 

@@ -107,11 +107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // winres emits "cargo:rustc-link-lib=dylib=resource" which might be stripped by the linker
             // if no symbols are used (which is true for a resource-only lib).
             // Explicitly linking the file forces it to be included.
-            // We apply this only to the main 'verichord' binary. The installer works fine without it (and crashes with duplicate resource if we add it).
-            println!(
-                "cargo:rustc-link-arg-bin=verichord={}",
-                out_dir.join("resource.lib").display()
-            );
+            // We applied it previously to the main 'verichord' binary but it caused duplicate VERSION
+            // resources on MSVC when winres already embedded the resource. Remove the explicit link
+            // and rely on `res.compile()` to supply the resource.
+            // println!(
+            //     "cargo:rustc-link-arg-bin=verichord={}",
+            //     out_dir.join("resource.lib").display()
+            // );
         }
     }
 
