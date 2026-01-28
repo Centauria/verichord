@@ -37,7 +37,9 @@ pub struct MidiApp {
     start_time: Option<Instant>,
     measures: u32,
     log_width_frac: f32,
-    chords: Vec<(u32, PitchOrderedSet, Duration)>,
+    // `chords` stores generated chords per-beat as (measure, beat_index, chord, gen_duration).
+    // Each measure now yields `time_sig_a` entries (one per beat).
+    chords: Vec<(u32, u32, PitchOrderedSet, Duration)>,
     chords_auto_scroll: bool,
     chords_scroll_direction: ChordScrollDirection,
     chord_pending_scroll_index: Option<usize>,
@@ -500,12 +502,25 @@ impl MidiApp {
         }
     }
 
-    fn ensure_chords_up_to(&mut self, up_to: u32) {
-        // `self.chords` stores predicted chords per measure (0-based).
-        // No chord is present initially. At the end of measure n, we summarize notes in measure n
-        // and generate the chord for measure n+1 (e.g. after measure 0 ends we will generate chord for measure 1).
-        let mut next = self.chords.last().map(|(m, _, _)| m + 1).unwrap_or(1);
-        while next <= up_to {
+    fn ensure_chords_accumulated(&mut self, target_len: usize) {
+        // `self.chords` stores predicted chords per-beat as (measure, beat_index, chord, duration).
+        // Iterate beat-by-beat until we reach `target_len`.
+        while self.chords.len() < target_len {
+            let next_idx = self.chords.len();
+            let time_sig_a = self.time_sig_a as u32;
+            let next_measure = (next_idx as u32) / time_sig_a;
+            let next_beat = (next_idx as u32) % time_sig_a;
+
+            // Handle M0.B0 specifically as N.C.
+            if next_idx == 0 {
+                self.chords
+                    .push((0, 0, PitchOrderedSet::new(), Duration::ZERO));
+                if self.chords_auto_scroll {
+                    self.chord_pending_scroll_index = Some(0);
+                }
+                continue;
+            }
+
             // Prefer the explicit capability check so we don't rely only on raw fn pointers.
             // This also makes use of `has_sample_next_chord()` so the helper is exercised.
             let sample_fn = self.selected_algo_idx.and_then(|idx| {
@@ -520,98 +535,97 @@ impl MidiApp {
             let last_chord = self
                 .chords
                 .last()
-                .map(|(_, c, _)| *c)
+                .map(|(_, _, c, _)| *c)
                 .unwrap_or(PitchOrderedSet::new());
             let start = Instant::now();
-            // Build normalized NoteData for the *previous* measure (`next - 1`).
+
+            // Notes are gathered from `src_measure`.
+            // For M0, src=0. For M>0, src=M-1.
+            let src_measure = next_measure.saturating_sub(1);
+
+            // Build normalized NoteData for the measure.
             let notes_for_measure: Vec<crate::algo_load::NoteData> = {
                 let mut notes = Vec::new();
-                if self.start_time.is_some() {
-                    // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
-                    let quarter_secs = 60.0 / (self.tempo_bpm as f32);
-                    let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
-                    let beats_per_measure: usize = self.time_sig_a as usize;
-                    let measure_secs = beat_secs * beats_per_measure as f32;
-                    // We are predicting chord for measure `next` using notes from measure `src_measure`.
-                    // Measures are 0-based: measure 0 starts at t=0.
-                    let src_measure = next.saturating_sub(1);
-                    let src_idx0 = src_measure as f32;
-                    let measure_start = src_idx0 * measure_secs;
-                    // lookahead: measure_end may be extended
-                    let mut measure_end = (src_idx0 + 1.0) * measure_secs;
-                    let mut lookahead_extra = 0.0f32;
-                    if self.lookahead_enabled {
-                        let lookahead = std::cmp::min(
-                            std::time::Duration::from_millis(50),
-                            std::time::Duration::from_secs_f32(beat_secs / 3.0),
-                        );
-                        lookahead_extra = lookahead.as_secs_f32() / measure_secs;
-                        measure_end += lookahead.as_secs_f32();
+                // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
+                let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                let beats_per_measure: usize = self.time_sig_a as usize;
+                let measure_secs = beat_secs * beats_per_measure as f32;
+
+                // We are predicting chord for measure `next` using notes from measure `src_measure`.
+                let src_idx0 = src_measure as f32;
+                let measure_start = src_idx0 * measure_secs;
+                // lookahead: measure_end may be extended
+                let mut measure_end = (src_idx0 + 1.0) * measure_secs;
+                let mut lookahead_extra = 0.0f32;
+                if self.lookahead_enabled {
+                    let lookahead = std::cmp::min(
+                        std::time::Duration::from_millis(50),
+                        std::time::Duration::from_secs_f32(beat_secs / 3.0),
+                    );
+                    lookahead_extra = lookahead.as_secs_f32() / measure_secs;
+                    measure_end += lookahead.as_secs_f32();
+                }
+
+                for hit in &self.note_hits {
+                    // convert normalized measure times to seconds relative to start_time
+                    // Note: note_hits stores normalized measure-based start/end.
+                    // But here we need to map robustly to source measure timeline.
+                    // The note_hits are stored assuming specific tempo? No, normalized.
+                    // "start * measure_secs" logic assumed global consistency.
+                    // Yes, we just multiply by current measure_secs.
+                    let s_elapsed = hit.start * measure_secs;
+
+                    // Exclude if note starts at/after measure end (with lookahead)
+                    if s_elapsed >= measure_end {
+                        continue;
                     }
 
-                    for hit in &self.note_hits {
-                        // convert normalized measure times to seconds relative to start_time
-                        let s_elapsed = hit.start * measure_secs;
-
-                        // Exclude if note starts at/after measure end (with lookahead)
-                        if s_elapsed >= measure_end {
+                    // Exclude if note ends at/before measure start.
+                    if let Some(e) = hit.end {
+                        let e_elapsed = e * measure_secs;
+                        if e_elapsed <= measure_start {
                             continue;
                         }
+                    }
 
-                        // Exclude if note ends at/before measure start.
-                        if let Some(e) = hit.end {
+                    // Normalize start/end within the source measure.
+                    // Notes started in a previous measure => start=0.0.
+                    let s_norm = if s_elapsed <= measure_start {
+                        0.0
+                    } else {
+                        ((s_elapsed - measure_start) / measure_secs)
+                            .clamp(0.0, 1.0 + lookahead_extra)
+                    };
+
+                    // Notes still active at the measure boundary => end=1.0 (或更大)
+                    let e_norm = match hit.end {
+                        Some(e) => {
                             let e_elapsed = e * measure_secs;
-                            if e_elapsed <= measure_start {
-                                continue;
+                            if e_elapsed >= measure_end {
+                                1.0 + lookahead_extra
+                            } else {
+                                ((e_elapsed - measure_start) / measure_secs)
+                                    .clamp(0.0, 1.0 + lookahead_extra)
                             }
                         }
+                        None => 1.0 + lookahead_extra,
+                    };
 
-                        // Normalize start/end within the source measure.
-                        // Notes started in a previous measure => start=0.0.
-                        let s_norm = if s_elapsed <= measure_start {
-                            0.0
-                        } else {
-                            ((s_elapsed - measure_start) / measure_secs)
-                                .clamp(0.0, 1.0 + lookahead_extra)
-                        };
+                    // Normalize velocity to [0,1] (MIDI velocities are 0..127)
+                    let v_norm = (hit.velocity as f32) / 127.0;
 
-                        // Notes still active at the measure boundary => end=1.0 (或更大)
-                        let e_norm = match hit.end {
-                            Some(e) => {
-                                let e_elapsed = e * measure_secs;
-                                if e_elapsed >= measure_end {
-                                    1.0 + lookahead_extra
-                                } else {
-                                    ((e_elapsed - measure_start) / measure_secs)
-                                        .clamp(0.0, 1.0 + lookahead_extra)
-                                }
-                            }
-                            None => 1.0 + lookahead_extra,
-                        };
-
-                        // Normalize velocity to [0,1] (MIDI velocities are 0..127)
-                        let v_norm = (hit.velocity as f32) / 127.0;
-
-                        notes.push(crate::algo_load::NoteData {
-                            pitch: hit.pitch as i32,
-                            start: s_norm,
-                            end: e_norm,
-                            velocity: v_norm,
-                        });
-                    }
+                    notes.push(crate::algo_load::NoteData {
+                        pitch: hit.pitch as i32,
+                        start: s_norm,
+                        end: e_norm,
+                        velocity: v_norm,
+                    });
                 }
                 notes
             };
-            for note in &notes_for_measure {
-                println!(
-                    "Note in measure {}: pitch={} start={:.3} end={:.3} vel={:.3}",
-                    next - 1,
-                    note.pitch,
-                    note.start,
-                    note.end,
-                    note.velocity
-                );
-            }
+
+            // Generate ONE chord for the current beat
             let chord = generate_chord_for_measure(
                 last_chord,
                 sample_fn,
@@ -620,18 +634,18 @@ impl MidiApp {
             );
             let elapsed = start.elapsed();
             println!(
-                "Generated chord for measure {}:\t{:032b} [{} ns]",
-                next,
+                "Generated chord for measure {} beat {}:\t{:032b} [{} ns]",
+                next_measure,
+                next_beat,
                 chord.get_data(),
                 elapsed.as_nanos()
             );
-            self.chords.push((next, chord, elapsed));
+            self.chords.push((next_measure, next_beat, chord, elapsed));
+
             if self.chords_auto_scroll {
-                // scroll to newly-added chord; account for optional initial card at index 0
-                self.chord_pending_scroll_index =
-                    Some(self.chords.len() - 1 + if self.show_initial_chord { 1 } else { 0 });
+                // scroll to newly-added chord
+                self.chord_pending_scroll_index = Some(self.chords.len() - 1);
             }
-            next += 1;
         }
     }
 
@@ -1818,59 +1832,14 @@ impl eframe::App for MidiApp {
                             }
                         }
 
-                        // chord generation per measure
+                        // chord generation per beat
                         if let Some(start) = self.start_time.filter(|_| self.scrolling_active) {
-                            // Use actual current time (now) to determine which measures are active.
-                            // Using `view_end` (quantized in Bar mode) can cause an off-by-one where the view
-                            // is already snapped to the end of the first measure and we end up generating
-                            // both measure 1 and 2 at the same time. Using `now` avoids that.
                             let elapsed = now.duration_since(start).as_secs_f32();
-                            // Convert to 1-based measure index so the first active measure is measure 1
-                            let current_measure_idx = (elapsed / measure_secs).floor() as u32;
-
-                            if !self.lookahead_enabled {
-                                // Behave as before: immediate generation
-                                self.ensure_chords_up_to(current_measure_idx);
-                                self.chord_gen_pending = None;
-                            } else {
-                                // Lookahead enabled: delay automatic generation until t after the start of the current measure
-                                // t = min(50ms, 1/3 beat)
-                                let lookahead = std::cmp::min(
-                                    std::time::Duration::from_millis(50),
-                                    std::time::Duration::from_secs_f32(beat_secs / 3.0),
-                                );
-                                let measure_start = start
-                                    + std::time::Duration::from_secs_f32(
-                                        current_measure_idx as f32 * measure_secs,
-                                    );
-                                let ready_at = measure_start + lookahead;
-                                if now >= ready_at {
-                                    self.ensure_chords_up_to(current_measure_idx);
-                                    self.chord_gen_pending = None;
-                                } else {
-                                    // schedule pending generation for this measure
-                                    match self.chord_gen_pending {
-                                        Some((m, t)) => {
-                                            if m < current_measure_idx || t != ready_at {
-                                                self.chord_gen_pending =
-                                                    Some((current_measure_idx, ready_at));
-                                            }
-                                        }
-                                        None => {
-                                            self.chord_gen_pending =
-                                                Some((current_measure_idx, ready_at));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // If there is a pending automatic chord generation and it's ready, run it now
-                        if let Some((target, ready_at)) = self.chord_gen_pending {
-                            if now >= ready_at {
-                                self.ensure_chords_up_to(target);
-                                self.chord_gen_pending = None;
-                            }
+                            // Generate chords up to including the current beat
+                            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                            let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                            let target_len = (elapsed / beat_secs).floor() as usize + 1;
+                            self.ensure_chords_accumulated(target_len);
                         }
 
                         // draw hits as rectangles spanning start..end (or start..view_end if active)
@@ -2120,7 +2089,8 @@ impl eframe::App for MidiApp {
                         let target = measures_present;
 
                         // Generate
-                        self.ensure_chords_up_to(target);
+                        let total_beats = (target as usize) * (self.time_sig_a as usize);
+                        self.ensure_chords_accumulated(total_beats);
                         ui.ctx().request_repaint();
 
                         self.status = format!("Regenerated chords up to measure {}", target);
@@ -2163,7 +2133,11 @@ impl eframe::App for MidiApp {
                                 // latest chord index in display (account for optional initial card)
                                 self.chord_pending_scroll_index = Some(
                                     self.chords.len() - 1
-                                        + if self.show_initial_chord { 1 } else { 0 },
+                                        + if self.show_initial_chord {
+                                            self.time_sig_a as usize
+                                        } else {
+                                            0
+                                        },
                                 );
                                 ui.ctx().request_repaint();
                             } else if self.show_initial_chord {
@@ -2201,15 +2175,28 @@ impl eframe::App for MidiApp {
                             ChordScrollDirection::Horizontal => ChordScrollDirection::Vertical,
                             ChordScrollDirection::Vertical => ChordScrollDirection::Horizontal,
                         };
-                        // if auto-scroll is on, ensure we move to the latest chord (or initial card if no chords)
+                        // if auto-scroll is on, ensure we move to the latest chord
                         if self.chords_auto_scroll {
                             if !self.chords.is_empty() {
-                                self.chord_pending_scroll_index = Some(
+                                let target_idx = if self.show_initial_chord {
                                     self.chords.len() - 1
-                                        + if self.show_initial_chord { 1 } else { 0 },
-                                );
-                            } else if self.show_initial_chord {
-                                self.chord_pending_scroll_index = Some(0);
+                                } else {
+                                    // if hiding initial, index is offset by how many items we hid?
+                                    // Actually, if we are scrolling to the last rect, we just need the index in display_chords.
+                                    // But chord_pending_scroll_index is used to scroll to rect at index.
+                                    // The widgets render display_chords.
+                                    // If show_initial=false, we hide M0 chords.
+                                    // self.chords contains all.
+                                    // We need to count how many are valid.
+                                    self.chords
+                                        .iter()
+                                        .filter(|c| c.0 > 0)
+                                        .count()
+                                        .saturating_sub(1)
+                                };
+                                self.chord_pending_scroll_index = Some(target_idx);
+                            } else {
+                                self.chord_pending_scroll_index = None;
                             }
                         }
                         ui.ctx().request_repaint();
@@ -2223,7 +2210,8 @@ impl eframe::App for MidiApp {
                 crate::ui::widgets::chord_cards_horizontal(
                     ui,
                     &self.chords,
-                    self.show_initial_chord,
+                    self.time_sig_a as u32,
+                    false, // show_initial
                     card_w,
                     card_h,
                     self.chords_auto_scroll,
@@ -2233,6 +2221,7 @@ impl eframe::App for MidiApp {
                 crate::ui::widgets::chord_cards_vertical(
                     ui,
                     &self.chords,
+                    self.time_sig_a as u32,
                     self.show_initial_chord,
                     card_w,
                     card_h,

@@ -156,11 +156,14 @@ impl ButtonWithShortcut for egui::Ui {
     }
 }
 
-/// Render chord cards in a horizontal scroll area. Accepts the owned chord list from the caller,
-/// optionally inserts an initial N.C. card at measure 0, and handles auto-scroll/pending scroll.
+/// Render chord cards in a horizontal scroll area. Now accepts per-beat chords
+/// as (measure, beat_index, chord, duration). Optionally inserts an initial group of
+/// N.C. cards (one per beat) at measure 0. Adjacent identical cards are merged visually;
+/// groups (per-measure) use a larger gap between them than internal gaps.
 pub fn chord_cards_horizontal(
     ui: &mut egui::Ui,
-    chords: &[(u32, PitchOrderedSet, Duration)],
+    chords: &[(u32, u32, PitchOrderedSet, Duration)],
+    _beats_per_measure: u32,
     show_initial: bool,
     card_w: f32,
     card_h: f32,
@@ -172,23 +175,52 @@ pub fn chord_cards_horizontal(
         .max_height(card_h + 16.0)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Build display list which optionally includes an initial N.C. card at measure 0
-                let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
-                if show_initial {
-                    display_chords.push((0, PitchOrderedSet::new(), Duration::ZERO));
+                let spacing = ui.spacing().item_spacing.x;
+                ui.spacing_mut().item_spacing.x = 0.0;
+
+                // Build display list handling "show_initial" setting
+                let mut display_chords: Vec<(u32, u32, PitchOrderedSet, Duration)> = Vec::new();
+                for c in chords {
+                    // if show_initial is false, skip measure 0
+                    if show_initial || c.0 > 0 {
+                        display_chords.push(c.clone());
+                    }
                 }
-                display_chords.extend(chords.iter().cloned());
 
                 let mut card_rects: Vec<egui::Rect> = Vec::new();
-                for (_i, (measure, chord, dur)) in display_chords.iter().enumerate() {
+
+                // Layout constants
+                let small_gap = spacing.min(4.0); // intra-measure (shorter)
+                let big_gap = small_gap * 2.0; // inter-measure
+                let beat_w = card_w; // use same width as configured card width for exact alignment
+
+                // Instead of drawing one rect per beat, merge consecutive identical chords into segments.
+                let mut i = 0usize;
+                while i < display_chords.len() {
+                    let (m, b, chord, _dur) = &display_chords[i];
+                    // extend as long as adjacent chords are identical
+                    let mut end = i;
+                    while end + 1 < display_chords.len() && display_chords[end + 1].2 == *chord {
+                        end += 1;
+                    }
+                    let count = end - i + 1;
+                    // compute width for this merged segment
+                    let seg_w = beat_w * (count as f32) + small_gap * ((count - 1) as f32);
+
+                    let total_dur: Duration =
+                        display_chords[i..=end].iter().map(|(_, _, _, d)| *d).sum();
+
+                    // allocate space and draw
                     let (rect, _resp) =
-                        ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(seg_w, card_h), egui::Sense::hover());
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(rect.shrink(4.0), 6.0, egui::Color32::from_rgb(60, 60, 70));
+
+                    // Label with measure.start_beat (1-based beat index)
                     painter.text(
                         rect.left_top() + egui::vec2(8.0, 6.0),
                         egui::Align2::LEFT_TOP,
-                        format!("{}.", measure),
+                        format!("{}.{}", m, b + 1),
                         egui::FontId::monospace(10.0),
                         egui::Color32::from_gray(200),
                     );
@@ -199,16 +231,33 @@ pub fn chord_cards_horizontal(
                         egui::FontId::proportional(18.0),
                         egui::Color32::WHITE,
                     );
-                    // Draw the measured duration in bottom-right with adaptive units
                     painter.text(
                         rect.right_bottom() - egui::vec2(6.0, 6.0),
                         egui::Align2::RIGHT_BOTTOM,
-                        crate::ui::helpers::format_duration_adaptive(*dur),
+                        crate::ui::helpers::format_duration_adaptive(total_dur),
                         egui::FontId::monospace(10.0),
                         egui::Color32::from_gray(180),
                     );
-                    card_rects.push(rect);
+
+                    // Push the same rect multiple times so indices map 1:1 to beats (useful for scroll targeting)
+                    for _ in 0..count {
+                        card_rects.push(rect);
+                    }
+
+                    // advance i
+                    i = end + 1;
+
+                    // insert gap before next segment: use big gap if next segment starts in a different measure
+                    if i < display_chords.len() {
+                        let next_measure = display_chords[i].0;
+                        if next_measure != *m {
+                            ui.add_space(big_gap);
+                        } else {
+                            ui.add_space(small_gap);
+                        }
+                    }
                 }
+
                 if let Some(idx) = chord_pending_scroll_index.take() {
                     if idx < card_rects.len() {
                         ui.scroll_to_rect(card_rects[idx], Some(egui::Align::Max));
@@ -221,9 +270,12 @@ pub fn chord_cards_horizontal(
 }
 
 /// Render chord cards in a wrapped vertical layout inside a vertical scroll area.
+/// Each measure occupies one horizontal row containing `beats_per_measure` beat cards.
+/// If the measure row is wider than available width, the row becomes horizontally scrollable.
 pub fn chord_cards_vertical(
     ui: &mut egui::Ui,
-    chords: &[(u32, PitchOrderedSet, Duration)],
+    chords: &[(u32, u32, PitchOrderedSet, Duration)],
+    _beats_per_measure: u32,
     show_initial: bool,
     card_w: f32,
     card_h: f32,
@@ -232,54 +284,198 @@ pub fn chord_cards_vertical(
 ) -> f32 {
     let out = egui::ScrollArea::vertical()
         .stick_to_bottom(auto_scroll)
-        .max_height(card_h * 4.0 + 16.0)
         .show(ui, |ui| {
             let available = ui.available_width();
-            let gap = ui.spacing().item_spacing.x;
-            let per_row = ((available + gap) / (card_w + gap)).floor().max(1.0) as usize;
+            let small_gap = ui.spacing().item_spacing.x.min(4.0);
+            let big_gap = small_gap * 2.0;
+            let beat_w = card_w;
             let mut card_rects: Vec<egui::Rect> = Vec::new();
-            // Build display list which optionally includes an initial N.C. card at measure 0
-            let mut display_chords: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
-            if show_initial {
-                display_chords.push((0, PitchOrderedSet::new(), Duration::ZERO));
-            }
-            display_chords.extend(chords.iter().cloned());
 
-            for chunk in display_chords.chunks(per_row) {
-                ui.horizontal(|ui| {
-                    for (_i, (measure, chord, dur)) in chunk.iter().enumerate() {
-                        let (rect, _resp) = ui
-                            .allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::hover());
-                        let painter = ui.painter_at(rect);
-                        painter.rect_filled(
-                            rect.shrink(4.0),
-                            6.0,
-                            egui::Color32::from_rgb(60, 60, 70),
-                        );
-                        painter.text(
-                            rect.left_top() + egui::vec2(8.0, 6.0),
-                            egui::Align2::LEFT_TOP,
-                            format!("{}.", measure),
-                            egui::FontId::monospace(10.0),
-                            egui::Color32::from_gray(200),
-                        );
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            chord.to_string(),
-                            egui::FontId::proportional(18.0),
-                            egui::Color32::WHITE,
-                        );
-                        painter.text(
-                            rect.right_bottom() - egui::vec2(6.0, 6.0),
-                            egui::Align2::RIGHT_BOTTOM,
-                            crate::ui::helpers::format_duration_adaptive(*dur),
-                            egui::FontId::monospace(10.0),
-                            egui::Color32::from_gray(180),
-                        );
-                        card_rects.push(rect);
+            // Build display list handling "show_initial" setting
+            let mut display_chords: Vec<(u32, u32, PitchOrderedSet, Duration)> = Vec::new();
+            for c in chords {
+                // if show_initial is false, skip measure 0
+                if show_initial || c.0 > 0 {
+                    display_chords.push(c.clone());
+                }
+            }
+
+            // Build measures vector: each entry is (measure, Vec<beats...>)
+            let mut measures: Vec<(u32, Vec<(u32, PitchOrderedSet, Duration)>)> = Vec::new();
+            let mut di = 0usize;
+            while di < display_chords.len() {
+                let measure = display_chords[di].0;
+                let mut beats: Vec<(u32, PitchOrderedSet, Duration)> = Vec::new();
+                while di < display_chords.len() && display_chords[di].0 == measure {
+                    let (_m, b, chord, dur) = display_chords[di].clone();
+                    beats.push((b, chord, dur));
+                    di += 1;
+                }
+                measures.push((measure, beats));
+            }
+
+            // Pack multiple measures per row if they fit; otherwise a row will be horizontally scrollable
+            let mut mi = 0usize;
+            while mi < measures.len() {
+                let mut row_indices: Vec<usize> = Vec::new();
+                let mut row_w: f32 = 0.0;
+                let mut mj = mi;
+                while mj < measures.len() {
+                    let beats_count = measures[mj].1.len();
+                    let measure_w = beat_w * (beats_count as f32)
+                        + small_gap * ((beats_count.saturating_sub(1)) as f32);
+                    let new_w = if row_w == 0.0 {
+                        measure_w
+                    } else {
+                        row_w + big_gap + measure_w
+                    };
+                    if new_w <= available {
+                        row_w = new_w;
+                        row_indices.push(mj);
+                        mj += 1;
+                    } else {
+                        if row_w == 0.0 {
+                            // force oversized single measure into the row (row will be scrollable)
+                            row_indices.push(mj);
+                            mj += 1;
+                        }
+                        break;
                     }
-                });
+                }
+
+                // render row
+                if row_w <= available {
+                    ui.horizontal(|ui_row| {
+                        ui_row.spacing_mut().item_spacing.x = 0.0;
+                        for (ri, &midx) in row_indices.iter().enumerate() {
+                            let (measure, beats) = &measures[midx];
+                            let mut j = 0usize;
+                            while j < beats.len() {
+                                let chord = &beats[j].1;
+                                let mut end = j;
+                                while end + 1 < beats.len() && beats[end + 1].1 == *chord {
+                                    end += 1;
+                                }
+                                let count = end - j + 1;
+                                let seg_w =
+                                    beat_w * (count as f32) + small_gap * ((count - 1) as f32);
+                                let total_dur: Duration =
+                                    beats[j..=end].iter().map(|(_, _, d)| *d).sum();
+                                let (rect, _resp) = ui_row.allocate_exact_size(
+                                    egui::vec2(seg_w, card_h),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui_row.painter_at(rect);
+                                painter.rect_filled(
+                                    rect.shrink(4.0),
+                                    6.0,
+                                    egui::Color32::from_rgb(60, 60, 70),
+                                );
+                                painter.text(
+                                    rect.left_top() + egui::vec2(8.0, 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{}.{}", measure, beats[j].0 + 1),
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_gray(200),
+                                );
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    beats[j].1.to_string(),
+                                    egui::FontId::proportional(18.0),
+                                    egui::Color32::WHITE,
+                                );
+                                painter.text(
+                                    rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                    egui::Align2::RIGHT_BOTTOM,
+                                    crate::ui::helpers::format_duration_adaptive(total_dur),
+                                    egui::FontId::monospace(10.0),
+                                    egui::Color32::from_gray(180),
+                                );
+                                for _ in 0..count {
+                                    card_rects.push(rect);
+                                }
+                                j = end + 1;
+                                if j < beats.len() {
+                                    ui_row.add_space(small_gap);
+                                }
+                            }
+                            if ri + 1 < row_indices.len() {
+                                ui_row.add_space(big_gap);
+                            }
+                        }
+                    });
+                } else {
+                    egui::ScrollArea::horizontal()
+                        .max_height(card_h + 16.0)
+                        .show(ui, |ui_row| {
+                            ui_row.horizontal(|ui_row| {
+                                ui_row.spacing_mut().item_spacing.x = 0.0;
+                                for (ri, &midx) in row_indices.iter().enumerate() {
+                                    let (measure, beats) = &measures[midx];
+                                    let mut j = 0usize;
+                                    while j < beats.len() {
+                                        let chord = &beats[j].1;
+                                        let mut end = j;
+                                        while end + 1 < beats.len() && beats[end + 1].1 == *chord {
+                                            end += 1;
+                                        }
+                                        let count = end - j + 1;
+                                        let seg_w = beat_w * (count as f32)
+                                            + small_gap * ((count - 1) as f32);
+                                        let total_dur: Duration =
+                                            beats[j..=end].iter().map(|(_, _, d)| *d).sum();
+                                        let (rect, _resp) = ui_row.allocate_exact_size(
+                                            egui::vec2(seg_w, card_h),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui_row.painter_at(rect);
+                                        painter.rect_filled(
+                                            rect.shrink(4.0),
+                                            6.0,
+                                            egui::Color32::from_rgb(60, 60, 70),
+                                        );
+                                        painter.text(
+                                            rect.left_top() + egui::vec2(8.0, 6.0),
+                                            egui::Align2::LEFT_TOP,
+                                            format!("{}.{}", measure, beats[j].0 + 1),
+                                            egui::FontId::monospace(10.0),
+                                            egui::Color32::from_gray(200),
+                                        );
+                                        painter.text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            beats[j].1.to_string(),
+                                            egui::FontId::proportional(18.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        painter.text(
+                                            rect.right_bottom() - egui::vec2(6.0, 6.0),
+                                            egui::Align2::RIGHT_BOTTOM,
+                                            crate::ui::helpers::format_duration_adaptive(total_dur),
+                                            egui::FontId::monospace(10.0),
+                                            egui::Color32::from_gray(180),
+                                        );
+                                        for _ in 0..count {
+                                            card_rects.push(rect);
+                                        }
+                                        j = end + 1;
+                                        if j < beats.len() {
+                                            ui_row.add_space(small_gap);
+                                        }
+                                    }
+                                    if ri + 1 < row_indices.len() {
+                                        ui_row.add_space(big_gap);
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                // small vertical padding between measure rows
+                ui.add_space(6.0);
+
+                mi = mj;
             }
 
             // Reserve space at the bottom so the last row can scroll above the status bar.
