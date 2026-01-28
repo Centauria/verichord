@@ -12,6 +12,12 @@ pub enum ChordScrollDirection {
     Vertical,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ChordUpdateFrequency {
+    Beat,
+    Measure,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppState {
@@ -27,6 +33,7 @@ pub struct AppState {
     pub lookahead_enabled: bool,
     pub selected_algo_idx: Option<usize>,
     pub show_initial_chord: bool,
+    pub chord_update_frequency: ChordUpdateFrequency,
 }
 
 impl Default for AppState {
@@ -44,6 +51,7 @@ impl Default for AppState {
             lookahead_enabled: true,
             selected_algo_idx: None,
             show_initial_chord: true,
+            chord_update_frequency: ChordUpdateFrequency::Beat,
         }
     }
 }

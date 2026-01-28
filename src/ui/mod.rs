@@ -19,7 +19,7 @@ mod helpers;
 mod state;
 mod widgets;
 
-use crate::ui::state::{AppState, ChordScrollDirection, ScrollMode};
+use crate::ui::state::{AppState, ChordScrollDirection, ChordUpdateFrequency, ScrollMode};
 use crate::ui::widgets::ButtonWithShortcut;
 
 pub struct MidiApp {
@@ -73,6 +73,8 @@ pub struct MidiApp {
     chord_gen_pending: Option<(u32, Instant)>,
     // When true, display an initial N.C. chord card at measure 0
     show_initial_chord: bool,
+    // Update frequency for chord generation (Beat = every beat, Measure = once per measure)
+    chord_update_frequency: ChordUpdateFrequency,
     // Last window title that was requested to the OS. Used to avoid redundant title updates.
     last_window_title: Option<String>,
 }
@@ -122,6 +124,7 @@ impl Default for MidiApp {
             lookahead_enabled: true,
             chord_gen_pending: None,
             show_initial_chord: false,
+            chord_update_frequency: ChordUpdateFrequency::Beat,
             last_window_title: None,
         };
         app.midi_in.ignore(Ignore::None);
@@ -149,6 +152,7 @@ impl MidiApp {
                 app.lookahead_enabled = state.lookahead_enabled;
                 app.selected_algo_idx = state.selected_algo_idx;
                 app.show_initial_chord = state.show_initial_chord;
+                app.chord_update_frequency = state.chord_update_frequency;
             }
         }
 
@@ -519,6 +523,22 @@ impl MidiApp {
                     self.chord_pending_scroll_index = Some(0);
                 }
                 continue;
+            }
+
+            // If we are in Measure update mode and this is not the first beat of the measure,
+            // simply duplicate the chord we already generated at measure start and record zero
+            // extra generation time for these extra beats.
+            if self.chord_update_frequency == ChordUpdateFrequency::Measure && next_beat != 0 {
+                if let Some((lm, _lb, prev_chord, _d)) = self.chords.last() {
+                    if *lm == next_measure {
+                        self.chords
+                            .push((next_measure, next_beat, *prev_chord, Duration::ZERO));
+                        if self.chords_auto_scroll {
+                            self.chord_pending_scroll_index = Some(self.chords.len() - 1);
+                        }
+                        continue;
+                    }
+                }
             }
 
             // Prefer the explicit capability check so we don't rely only on raw fn pointers.
@@ -939,6 +959,7 @@ impl eframe::App for MidiApp {
             lookahead_enabled: self.lookahead_enabled,
             selected_algo_idx: self.selected_algo_idx,
             show_initial_chord: self.show_initial_chord,
+            chord_update_frequency: self.chord_update_frequency,
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -1114,6 +1135,9 @@ impl eframe::App for MidiApp {
                 });
 
                 ui.menu_button("Settings", |ui| {
+                    ui.label("Chord update frequency:");
+                    ui.radio_value(&mut self.chord_update_frequency, ChordUpdateFrequency::Beat, "Beat");
+                    ui.radio_value(&mut self.chord_update_frequency, ChordUpdateFrequency::Measure, "Measure");
                     ui.separator();
                     ui.label("Scroll Mode:");
                     ui.radio_value(&mut self.scroll_mode, ScrollMode::Smooth, "Smooth");
