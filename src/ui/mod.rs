@@ -2232,10 +2232,14 @@ impl eframe::App for MidiApp {
 
             // Detect user manual scrolling and disable auto-scroll
             if self.chords_auto_scroll {
-                if let Some(last_offset) = self.last_chord_scroll_offset {
-                    // If user scrolled away from the end (offset decreased), disable auto-scroll
-                    if current_offset < last_offset - 1.0 {
-                        self.chords_auto_scroll = false;
+                // If chords are empty (e.g. just cleared via Ctrl+N or start recording),
+                // the offset naturally drops to near-zero. We ignore this drop to keep scroll lock.
+                if !self.chords.is_empty() {
+                    if let Some(last_offset) = self.last_chord_scroll_offset {
+                        // If user scrolled away from the end (offset decreased), disable auto-scroll
+                        if current_offset < last_offset - 1.0 {
+                            self.chords_auto_scroll = false;
+                        }
                     }
                 }
                 self.last_chord_scroll_offset = Some(current_offset);
