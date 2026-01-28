@@ -561,9 +561,15 @@ impl MidiApp {
 
             // Notes are gathered from `src_measure`.
             // For M0, src=0. For M>0, src=M-1.
-            let src_measure = next_measure.saturating_sub(1);
+            // If updating per-beat, use the previous beat's measure as the source.
+            let src_measure = if self.chord_update_frequency == ChordUpdateFrequency::Beat {
+                let prev_global = if next_idx == 0 { 0 } else { next_idx - 1 };
+                (prev_global as u32) / time_sig_a
+            } else {
+                next_measure.saturating_sub(1)
+            };
 
-            // Build normalized NoteData for the measure.
+            // Build normalized NoteData for the measure (or previous beat when in Beat mode).
             let notes_for_measure: Vec<crate::algo_load::NoteData> = {
                 let mut notes = Vec::new();
                 // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
@@ -572,79 +578,155 @@ impl MidiApp {
                 let beats_per_measure: usize = self.time_sig_a as usize;
                 let measure_secs = beat_secs * beats_per_measure as f32;
 
-                // We are predicting chord for measure `next` using notes from measure `src_measure`.
-                let src_idx0 = src_measure as f32;
-                let measure_start = src_idx0 * measure_secs;
-                // lookahead: measure_end may be extended
-                let mut measure_end = (src_idx0 + 1.0) * measure_secs;
+                // Small lookahead (in measure-fraction units) if enabled
                 let mut lookahead_extra = 0.0f32;
+                let mut lookahead_secs = 0.0f32;
                 if self.lookahead_enabled {
                     let lookahead = std::cmp::min(
                         std::time::Duration::from_millis(50),
                         std::time::Duration::from_secs_f32(beat_secs / 3.0),
                     );
-                    lookahead_extra = lookahead.as_secs_f32() / measure_secs;
-                    measure_end += lookahead.as_secs_f32();
+                    lookahead_secs = lookahead.as_secs_f32();
+                    lookahead_extra = lookahead_secs / measure_secs;
                 }
 
-                for hit in &self.note_hits {
-                    // convert normalized measure times to seconds relative to start_time
-                    // Note: note_hits stores normalized measure-based start/end.
-                    // But here we need to map robustly to source measure timeline.
-                    // The note_hits are stored assuming specific tempo? No, normalized.
-                    // "start * measure_secs" logic assumed global consistency.
-                    // Yes, we just multiply by current measure_secs.
-                    let s_elapsed = hit.start * measure_secs;
+                if self.chord_update_frequency == ChordUpdateFrequency::Beat {
+                    // Use notes from the just-past beat only.
+                    let prev_global = if next_idx == 0 { 0 } else { next_idx - 1 };
+                    let prev_measure = (prev_global as u32) / self.time_sig_a as u32;
+                    let prev_beat = (prev_global as u32) % self.time_sig_a as u32;
 
-                    // Exclude if note starts at/after measure end (with lookahead)
-                    if s_elapsed >= measure_end {
-                        continue;
-                    }
+                    let src_idx0 = prev_measure as f32;
+                    let measure_start = src_idx0 * measure_secs;
+                    let beat_start_secs = measure_start + (prev_beat as f32) * beat_secs;
+                    let beat_end_secs = beat_start_secs + beat_secs + lookahead_secs;
 
-                    // Exclude if note ends at/before measure start.
-                    if let Some(e) = hit.end {
-                        let e_elapsed = e * measure_secs;
-                        if e_elapsed <= measure_start {
+                    for hit in &self.note_hits {
+                        let s_elapsed = hit.start * measure_secs;
+
+                        // Exclude notes that start at/after the end of the beat window
+                        if s_elapsed >= beat_end_secs {
                             continue;
                         }
-                    }
 
-                    // Normalize start/end within the source measure.
-                    // Notes started in a previous measure => start=0.0.
-                    let s_norm = if s_elapsed <= measure_start {
-                        0.0
-                    } else {
-                        ((s_elapsed - measure_start) / measure_secs)
-                            .clamp(0.0, 1.0 + lookahead_extra)
-                    };
-
-                    // Notes still active at the measure boundary => end=1.0 (或更大)
-                    let e_norm = match hit.end {
-                        Some(e) => {
+                        // Exclude notes that end at/before the start of the beat window
+                        if let Some(e) = hit.end {
                             let e_elapsed = e * measure_secs;
-                            if e_elapsed >= measure_end {
-                                1.0 + lookahead_extra
-                            } else {
-                                ((e_elapsed - measure_start) / measure_secs)
-                                    .clamp(0.0, 1.0 + lookahead_extra)
+                            if e_elapsed <= beat_start_secs {
+                                continue;
                             }
                         }
-                        None => 1.0 + lookahead_extra,
-                    };
 
-                    // Normalize velocity to [0,1] (MIDI velocities are 0..127)
-                    let v_norm = (hit.velocity as f32) / 127.0;
+                        // Normalize start/end within the source measure (keep measure-based normalization).
+                        let s_norm = if s_elapsed <= measure_start {
+                            0.0
+                        } else {
+                            ((s_elapsed - measure_start) / measure_secs)
+                                .clamp(0.0, 1.0 + lookahead_extra)
+                        };
 
-                    notes.push(crate::algo_load::NoteData {
-                        pitch: hit.pitch as i32,
-                        start: s_norm,
-                        end: e_norm,
-                        velocity: v_norm,
-                    });
+                        let e_norm = match hit.end {
+                            Some(e) => {
+                                let e_elapsed = e * measure_secs;
+                                if e_elapsed >= beat_end_secs {
+                                    ((beat_end_secs - measure_start) / measure_secs)
+                                        .min(1.0 + lookahead_extra)
+                                } else {
+                                    ((e_elapsed - measure_start) / measure_secs)
+                                        .clamp(0.0, 1.0 + lookahead_extra)
+                                }
+                            }
+                            None => ((beat_end_secs - measure_start) / measure_secs)
+                                .min(1.0 + lookahead_extra),
+                        };
+
+                        let v_norm = (hit.velocity as f32) / 127.0;
+
+                        notes.push(crate::algo_load::NoteData {
+                            pitch: hit.pitch as i32,
+                            start: s_norm,
+                            end: e_norm,
+                            velocity: v_norm,
+                        });
+                    }
+                } else {
+                    // Existing behaviour: collect notes from the whole source measure.
+                    let src_idx0 = src_measure as f32;
+                    let measure_start = src_idx0 * measure_secs;
+                    // lookahead: measure_end may be extended
+                    let mut measure_end = (src_idx0 + 1.0) * measure_secs;
+                    if self.lookahead_enabled {
+                        measure_end += lookahead_secs;
+                    }
+
+                    for hit in &self.note_hits {
+                        let s_elapsed = hit.start * measure_secs;
+
+                        // Exclude if note starts at/after measure end (with lookahead)
+                        if s_elapsed >= measure_end {
+                            continue;
+                        }
+
+                        // Exclude if note ends at/before measure start.
+                        if let Some(e) = hit.end {
+                            let e_elapsed = e * measure_secs;
+                            if e_elapsed <= measure_start {
+                                continue;
+                            }
+                        }
+
+                        // Normalize start/end within the source measure.
+                        // Notes started in a previous measure => start=0.0.
+                        let s_norm = if s_elapsed <= measure_start {
+                            0.0
+                        } else {
+                            ((s_elapsed - measure_start) / measure_secs)
+                                .clamp(0.0, 1.0 + lookahead_extra)
+                        };
+
+                        // Notes still active at the measure boundary => end=1.0 (或更大)
+                        let e_norm = match hit.end {
+                            Some(e) => {
+                                let e_elapsed = e * measure_secs;
+                                if e_elapsed >= measure_end {
+                                    1.0 + lookahead_extra
+                                } else {
+                                    ((e_elapsed - measure_start) / measure_secs)
+                                        .clamp(0.0, 1.0 + lookahead_extra)
+                                }
+                            }
+                            None => 1.0 + lookahead_extra,
+                        };
+
+                        // Normalize velocity to [0,1] (MIDI velocities are 0..127)
+                        let v_norm = (hit.velocity as f32) / 127.0;
+
+                        notes.push(crate::algo_load::NoteData {
+                            pitch: hit.pitch as i32,
+                            start: s_norm,
+                            end: e_norm,
+                            velocity: v_norm,
+                        });
+                    }
                 }
+
                 notes
             };
-
+            for note in &notes_for_measure {
+                println!(
+                    "Note in measure {} beat {}: pitch={} start={:.3} end={:.3} vel={:.3}",
+                    if next_beat == 0 {
+                        next_measure - 1
+                    } else {
+                        next_measure
+                    },
+                    (next_beat + self.time_sig_a as u32 - 1) % self.time_sig_a as u32,
+                    note.pitch,
+                    note.start,
+                    note.end,
+                    note.velocity
+                );
+            }
             // Generate ONE chord for the current beat
             let chord = generate_chord_for_measure(
                 last_chord,
