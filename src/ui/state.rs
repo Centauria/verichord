@@ -34,6 +34,8 @@ pub struct AppState {
     pub selected_algo_idx: Option<usize>,
     pub show_initial_chord: bool,
     pub chord_update_frequency: ChordUpdateFrequency,
+    pub midi_in_name: Option<String>,
+    pub midi_out_name: Option<String>,
 }
 
 impl Default for AppState {
@@ -52,6 +54,8 @@ impl Default for AppState {
             selected_algo_idx: None,
             show_initial_chord: true,
             chord_update_frequency: ChordUpdateFrequency::Beat,
+            midi_in_name: None,
+            midi_out_name: None,
         }
     }
 }

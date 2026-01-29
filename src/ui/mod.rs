@@ -1,6 +1,6 @@
 use chrono::Local;
 use eframe::{egui, egui::ComboBox};
-use midir::{Ignore, MidiInput, MidiInputConnection};
+use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,10 @@ pub struct MidiApp {
     ports: Vec<String>,
     selected: Option<usize>,
     connection: Option<MidiInputConnection<()>>,
+    midi_out: MidiOutput,
+    out_ports: Vec<String>,
+    out_selected: Option<usize>,
+    out_connection: Option<MidiOutputConnection>,
     tx: Sender<(Vec<u8>, Instant)>,
     rx: Receiver<(Vec<u8>, Instant)>,
     log: Vec<String>,
@@ -83,12 +87,18 @@ impl Default for MidiApp {
     fn default() -> Self {
         let midi_in = MidiInput::new("verichord")
             .unwrap_or_else(|_| MidiInput::new("verichord-fallback").unwrap());
+        let midi_out = MidiOutput::new("verichord-out")
+            .unwrap_or_else(|_| MidiOutput::new("verichord-out-fallback").unwrap());
         let (tx, rx) = mpsc::channel();
         let mut app = MidiApp {
             midi_in,
+            midi_out,
             ports: Vec::new(),
             selected: None,
             connection: None,
+            out_ports: Vec::new(),
+            out_selected: None,
+            out_connection: None,
             tx,
             rx,
             log: Vec::new(),
@@ -130,6 +140,7 @@ impl Default for MidiApp {
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
         app.refresh_algos();
+        app.refresh_output_ports();
         app
     }
 }
@@ -138,6 +149,9 @@ impl MidiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
 
+        // Temporarily capture saved MIDI names so we can restore selection after we refresh port lists
+        let mut saved_midi_in: Option<String> = None;
+        let mut saved_midi_out: Option<String> = None;
         if let Some(storage) = cc.storage {
             if let Some(state) = eframe::get_value::<AppState>(storage, eframe::APP_KEY) {
                 app.tempo_bpm = state.tempo_bpm;
@@ -153,12 +167,28 @@ impl MidiApp {
                 app.selected_algo_idx = state.selected_algo_idx;
                 app.show_initial_chord = state.show_initial_chord;
                 app.chord_update_frequency = state.chord_update_frequency;
+
+                saved_midi_in = state.midi_in_name.clone();
+                saved_midi_out = state.midi_out_name.clone();
             }
         }
 
         // Refresh ports/algos to ensure valid state even if loaded config is stale
         app.refresh_ports();
         app.refresh_algos();
+        app.refresh_output_ports();
+
+        // Restore saved selections by device name if the device is present; otherwise leave selection unchanged
+        if let Some(name) = saved_midi_in {
+            if let Some(idx) = app.ports.iter().position(|n| n == &name) {
+                app.selected = Some(idx);
+            }
+        }
+        if let Some(name) = saved_midi_out {
+            if let Some(idx) = app.out_ports.iter().position(|n| n == &name) {
+                app.out_selected = Some(idx);
+            }
+        }
 
         app
     }
@@ -174,6 +204,20 @@ impl MidiApp {
         }
         if self.selected.is_none() && !self.ports.is_empty() {
             self.selected = Some(0);
+        }
+    }
+
+    fn refresh_output_ports(&mut self) {
+        self.out_ports.clear();
+        let list = self.midi_out.ports();
+        for p in list {
+            match self.midi_out.port_name(&p) {
+                Ok(name) => self.out_ports.push(name),
+                Err(_) => self.out_ports.push("Unnamed port".to_string()),
+            }
+        }
+        if self.out_selected.is_none() && !self.out_ports.is_empty() {
+            self.out_selected = Some(0);
         }
     }
 
@@ -294,6 +338,48 @@ impl MidiApp {
             self.chord_gen_pending = None;
         } else {
             self.status = "No open connection".to_string();
+        }
+    }
+
+    pub fn open_selected_output(&mut self) {
+        if self.out_connection.is_some() {
+            self.status = "Output already open".to_string();
+            return;
+        }
+        if let Some(idx) = self.out_selected {
+            let ports = self.midi_out.ports();
+            if idx >= ports.len() {
+                self.status = "Invalid output selected".to_string();
+                return;
+            }
+            let port = &ports[idx];
+            let port_name = self
+                .midi_out
+                .port_name(port)
+                .unwrap_or_else(|_| "Unnamed".to_string());
+
+            let connector = MidiOutput::new("verichord-connection")
+                .unwrap_or_else(|_| MidiOutput::new("verichord-conn-fallback").unwrap());
+            match connector.connect(port, "verichord-output") {
+                Ok(conn) => {
+                    self.status = format!("Output Open: {}", port_name);
+                    self.out_connection = Some(conn);
+                }
+                Err(e) => {
+                    self.status = format!("Failed to open output: {}", e);
+                }
+            }
+        } else {
+            self.status = "No output selected".to_string();
+        }
+    }
+
+    pub fn close_output_connection(&mut self) {
+        if let Some(conn) = self.out_connection.take() {
+            drop(conn);
+            self.status = "Output closed".to_string();
+        } else {
+            self.status = "No open output".to_string();
         }
     }
 
@@ -502,6 +588,13 @@ impl MidiApp {
             if self.log_auto_scroll {
                 // request a forced scroll to bottom on next UI update
                 self.log_pending_scroll = true;
+            }
+
+            // Forward raw MIDI messages to opened MIDI output, if any.
+            if let Some(conn) = self.out_connection.as_mut() {
+                if let Err(e) = conn.send(&bytes) {
+                    self.status = format!("MIDI send failed: {}", e);
+                }
             }
         }
     }
@@ -1042,6 +1135,10 @@ impl eframe::App for MidiApp {
             selected_algo_idx: self.selected_algo_idx,
             show_initial_chord: self.show_initial_chord,
             chord_update_frequency: self.chord_update_frequency,
+            midi_in_name: self.selected.and_then(|i| self.ports.get(i).cloned()),
+            midi_out_name: self
+                .out_selected
+                .and_then(|i| self.out_ports.get(i).cloned()),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -1287,7 +1384,7 @@ impl eframe::App for MidiApp {
 
             ui.horizontal(|ui| {
                 ui.label("MIDI Input:");
-                ComboBox::from_label("")
+                ComboBox::from_id_salt("midi_input")
                     .selected_text(
                         self.selected
                             .and_then(|i| self.ports.get(i))
@@ -1310,6 +1407,36 @@ impl eframe::App for MidiApp {
                 } else {
                     if ui.button("Open").clicked() {
                         self.open_selected(ctx);
+                    }
+                }
+            });
+
+            // MIDI Output selector (similar controls to MIDI Input)
+            ui.horizontal(|ui| {
+                ui.label("MIDI Output:");
+                ComboBox::from_id_salt("midi_output")
+                    .selected_text(
+                        self.out_selected
+                            .and_then(|i| self.out_ports.get(i))
+                            .cloned()
+                            .unwrap_or("(none)".to_owned()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, name) in self.out_ports.iter().enumerate() {
+                            ui.selectable_value(&mut self.out_selected, Some(i), name);
+                        }
+                    });
+                if ui.button("Refresh").clicked() {
+                    self.refresh_output_ports();
+                }
+
+                if self.out_connection.is_some() {
+                    if ui.button("Close").clicked() {
+                        self.close_output_connection();
+                    }
+                } else {
+                    if ui.button("Open").clicked() {
+                        self.open_selected_output();
                     }
                 }
             });
