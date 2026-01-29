@@ -821,11 +821,17 @@ impl MidiApp {
                 );
             }
             // Generate ONE chord for the current beat
+            let num_beats = if self.chord_update_frequency == ChordUpdateFrequency::Beat {
+                1u32
+            } else {
+                self.time_sig_a as u32
+            };
             let chord = generate_chord_for_measure(
                 last_chord,
                 sample_fn,
                 &notes_for_measure,
                 self.time_sig_a as u32,
+                num_beats,
             );
             let elapsed = start.elapsed();
             println!(

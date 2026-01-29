@@ -58,6 +58,7 @@ pub fn generate_chord_for_measure(
     sample_fn: Option<SampleNextChordFn>,
     notes: &[crate::algo_load::NoteData],
     beats_per_bar: u32,
+    num_beats: u32,
 ) -> PitchOrderedSet {
     // If a sample function is provided, call it and use its numeric result as the chord representation.
     // The plugin is expected to return the packed `u32` representation compatible with `PitchOrderedSet`.
@@ -67,7 +68,15 @@ pub fn generate_chord_for_measure(
         } else {
             notes.as_ptr()
         };
-        let out = unsafe { func(last_chord.get_data(), ptr, notes.len(), beats_per_bar) };
+        let out = unsafe {
+            func(
+                last_chord.get_data(),
+                ptr,
+                notes.len(),
+                beats_per_bar,
+                num_beats,
+            )
+        };
         return PitchOrderedSet::from_data(out);
     }
     // Fallback if no plugin is selected or the selected library doesn't export the symbol.

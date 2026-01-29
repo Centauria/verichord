@@ -3,7 +3,7 @@
 //!
 //! The plugin is expected to export the symbol with C linkage:
 //! ```cpp
-//! extern "C" uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
+//! extern "C" uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar, uint32_t num_beats);
 //! ```
 //!
 //! Example usage in Rust:
@@ -11,8 +11,8 @@
 //! let algos = algo_load::find_algos_in_exe_dir().unwrap_or_default();
 //! for a in &algos {
 //!     if a.has_sample_next_chord() {
-//!         // example: input=42, no notes, 4 beats per bar
-//!         let out = a.sample_next_chord(42, &[], 4).unwrap();
+//!         // example: input=42, no notes, 4 beats per bar, num_beats=4
+//!         let out = a.sample_next_chord(42, &[], 4, 4).unwrap();
 //!         println!("{} -> {}", a.name, out);
 //!     }
 //! }
@@ -28,7 +28,7 @@ use std::{
 
 use libloading::Library;
 
-/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar, uint32_t num_beats);
 ///
 /// The `NoteData` structure (C layout):
 /// ```c
@@ -48,8 +48,8 @@ pub struct NoteData {
     pub velocity: f32,
 }
 
-/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar);
-pub type SampleNextChordFn = unsafe extern "C" fn(u32, *const NoteData, usize, u32) -> u32;
+/// C function signature: uint32_t sample_next_chord(uint32_t input, const NoteData *input_notes, size_t note_count, uint32_t beats_per_bar, uint32_t num_beats);
+pub type SampleNextChordFn = unsafe extern "C" fn(u32, *const NoteData, usize, u32, u32) -> u32;
 
 /// Represents a loaded algorithm library. Keeps the `Library` handle alive
 /// to ensure any obtained function pointers remain valid while the struct lives.
@@ -162,13 +162,14 @@ impl AlgoLib {
         self.sample_next_chord
     }
 
-    /// Call `sample_next_chord` with normalized note data and the number of beats per bar. Returns `Some(result)` if available.
+    /// Call `sample_next_chord` with normalized note data, the number of beats per bar, and the number of beats included in this update (num_beats). Returns `Some(result)` if available.
     #[allow(dead_code)]
     pub fn sample_next_chord(
         &self,
         input: u32,
         notes: &[NoteData],
         beats_per_bar: u32,
+        num_beats: u32,
     ) -> Option<u32> {
         let ptr = if notes.is_empty() {
             std::ptr::null()
@@ -176,7 +177,7 @@ impl AlgoLib {
             notes.as_ptr()
         };
         self.sample_next_chord
-            .map(|f| unsafe { f(input, ptr, notes.len(), beats_per_bar) })
+            .map(|f| unsafe { f(input, ptr, notes.len(), beats_per_bar, num_beats) })
     }
 
     /// Return the filename without extension (file stem) if available.
