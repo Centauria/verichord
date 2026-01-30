@@ -81,6 +81,12 @@ pub struct MidiApp {
     chord_update_frequency: ChordUpdateFrequency,
     // Last window title that was requested to the OS. Used to avoid redundant title updates.
     last_window_title: Option<String>,
+    // Playback state
+    playback_active: bool,
+    playback_start_time: Option<Instant>,
+    pub cursor_pos: f32,
+    playback_start_cursor: f32,
+    playback_viewport_fraction: f32,
 }
 
 impl Default for MidiApp {
@@ -136,6 +142,11 @@ impl Default for MidiApp {
             show_initial_chord: false,
             chord_update_frequency: ChordUpdateFrequency::Beat,
             last_window_title: None,
+            playback_active: false,
+            playback_start_time: None,
+            cursor_pos: 0.0,
+            playback_start_cursor: 0.0,
+            playback_viewport_fraction: 0.5,
         };
         app.midi_in.ignore(Ignore::None);
         app.refresh_ports();
@@ -283,6 +294,7 @@ impl MidiApp {
                     self.note_hits.clear();
                     self.chords.clear();
                     self.chord_pending_scroll_index = None;
+                    self.cursor_pos = 0.0;
                     // reset scroll bookkeeping so UI doesn't immediately disable auto-scroll or jump
                     self.log_pending_scroll = false;
                     self.last_log_scroll_offset = None;
@@ -383,7 +395,14 @@ impl MidiApp {
         }
     }
 
-    fn start_recording(&mut self, anchor: Instant) {
+    fn start_recording(&mut self, _ignored_anchor: Instant) {
+        // Calculate anchor based on cursor_pos so that 'now' corresponds to cursor_pos
+        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+        let measure_secs = beat_secs * (self.time_sig_a as f32);
+        let offset = Duration::from_secs_f32(self.cursor_pos * measure_secs);
+        let anchor = Instant::now() - offset;
+
         self.recording_enabled = true;
         self.start_time = Some(anchor);
         self.scrolling_active = true;
@@ -413,11 +432,33 @@ impl MidiApp {
             }
         }
 
-        // Clear old generated content so re-recording starts fresh
+        // Overwrite mode: Remove/Truncate future notes.
+        // 1. Remove notes that start at or after the cursor.
+        self.note_hits.retain(|h| h.start < self.cursor_pos);
+        // 2. Truncate notes that obtained before but end after cursor.
+        for h in self.note_hits.iter_mut() {
+            if let Some(end) = h.end {
+                if end > self.cursor_pos {
+                    h.end = Some(self.cursor_pos);
+                    // If we had a way to send NoteOff for this pitch now, we should,
+                    // but these consist of recorded data, not necessarily live sound,
+                    // unless we are playing back.
+                }
+            } else {
+                // Open-ended note (shouldn't happen in stored hits usually, but for safety)
+                h.end = Some(self.cursor_pos);
+            }
+        }
+
+        // We do typically clear chords/log in a new take, but with punch-in,
+        // maybe we should keep previous chords?
+        // For simplicity and matching "replace" semantics, we clear `chords`
+        // because generation depends on the new context potentially.
+        // Actually, if we overwrite, we might invalid old chords.
+        // Let's clear chords for now to trigger regeneration.
         self.chords.clear();
         self.chord_pending_scroll_index = None;
-        // Clear prior MIDI hits and event log to avoid showing previous recordings
-        self.note_hits.clear();
+
         self.log.clear();
         self.recording_ended_at = None;
 
@@ -444,6 +485,157 @@ impl MidiApp {
                 m.set_anchor(anchor);
                 self.metronome = Some(m);
             }
+        }
+    }
+
+    fn start_playback(&mut self) {
+        if self.playback_active {
+            return;
+        }
+        // Ensure connection is appropriate?
+        // User said: "send to MIDI Out. If not specified, do nothing".
+        // We allow starting playback even without MIDI Out, just to move cursor.
+
+        // Check if cursor is already at or past the end of the recording.
+        // If so, do not start playback (per user request "光标不应该再往前走").
+        // We consider the end to be the later of recording_ended_at or the max note end.
+        let end_meas_from_notes = self
+            .note_hits
+            .iter()
+            .map(|h| h.end.unwrap_or(h.start))
+            .fold(0.0_f32, f32::max);
+
+        // Calculate max measure duration from recording_ended_at (if available and relevant)
+        // Since we are about to re-anchor start_time, let's calculate relative to whatever start_time exists now
+        // or just use measures.
+        // Actually simpler: if we have `recording_ended_at` and `start_time`, we can compute duration.
+        // If not, rely on notes.
+        let mut max_duration_meas = end_meas_from_notes;
+
+        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+        let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+        if let (Some(s), Some(e)) = (self.start_time, self.recording_ended_at) {
+            if e > s {
+                let dur_secs = e.duration_since(s).as_secs_f32();
+                let dur_meas = dur_secs / measure_secs;
+                if dur_meas > max_duration_meas {
+                    max_duration_meas = dur_meas;
+                }
+            }
+        }
+
+        // Tolerance: if within small epsilon of end, or past it, don't start.
+        if self.cursor_pos >= max_duration_meas - 0.01 {
+            return;
+        }
+
+        // 1. Calculate and lock the current visual cursor position fraction [0.0 (left) .. 1.0 (right)]
+        // This ensures the cursor visually stays where it is while the grid moves underneath.
+        let fraction = if let Some(start) = self.start_time {
+            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+            let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+            let measure_secs = beat_secs * (self.time_sig_a as f32);
+            let window_secs = measure_secs * (self.measures as f32);
+
+            let cursor_time_secs = self.cursor_pos * measure_secs;
+
+            if let Some(frozen_end) = self.frozen_view_end {
+                let view_end_secs = frozen_end.duration_since(start).as_secs_f32();
+                let view_start_secs = view_end_secs - window_secs;
+                if window_secs > 0.0 {
+                    (cursor_time_secs - view_start_secs) / window_secs
+                } else {
+                    0.5
+                }
+            } else {
+                // Live view (recording)? Usually cursor is at right (1.0).
+                // Or we haven't frozen yet. Assumes right edge for now.
+                1.0
+            }
+        } else {
+            // Static view [0 .. measures]
+            if self.measures > 0 {
+                self.cursor_pos / (self.measures as f32)
+            } else {
+                0.0
+            }
+        };
+        self.playback_viewport_fraction = fraction.clamp(0.0, 1.0);
+
+        // Relocate start_time so that current cursor position aligns with "now".
+        // This ensures the view (which follows "now" when scrolling_active=true) shows the cursor
+        // and that "elapsed" calculations are correct relative to the new start time.
+        let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+        let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+        let measure_secs = beat_secs * (self.time_sig_a as f32);
+        let cursor_offset = Duration::from_secs_f32(self.cursor_pos * measure_secs);
+        let now = Instant::now();
+
+        let new_start = now.checked_sub(cursor_offset).unwrap_or(now);
+
+        // Adjust recording_ended_at to maintain song duration relative to new start
+        if let Some(old_start) = self.start_time {
+            if let Some(old_end) = self.recording_ended_at {
+                // if strictly later than start
+                if old_end > old_start {
+                    let dur = old_end - old_start;
+                    self.recording_ended_at = Some(new_start + dur);
+                } else {
+                    self.recording_ended_at = Some(new_start);
+                }
+            }
+        }
+        self.start_time = Some(new_start);
+
+        self.playback_active = true;
+        self.playback_start_time = Some(now);
+        self.playback_start_cursor = self.cursor_pos;
+        self.scrolling_active = true;
+        self.frozen_view_end = None; // Unfreeze view to follow cursor
+        self.status = "Playback started".to_string();
+
+        // Update metronome anchor if active
+        if self.metronome_enabled {
+            if let Some(m) = &self.metronome {
+                m.set_anchor(new_start);
+            }
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if !self.playback_active {
+            return;
+        }
+        self.playback_active = false;
+        self.playback_start_time = None;
+        self.scrolling_active = false;
+        self.status = "Playback stopped".to_string();
+
+        // Freeze view at current cursor, respecting the viewport fraction.
+        // We want the cursor (at cursor_secs) to remain at `playback_viewport_fraction` of the window.
+        // Window = [view_end - window_secs, view_end]
+        // Cursor = view_start + fraction * window = view_end - window + fraction * window = view_end - (1-fraction)*window
+        // => view_end = Cursor + (1 - fraction) * window
+        if let Some(start) = self.start_time {
+            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+            let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+            let measure_secs = beat_secs * (self.time_sig_a as f32);
+            let window_secs = measure_secs * (self.measures as f32);
+
+            let cursor_secs = self.cursor_pos * measure_secs;
+            let extra_secs = (1.0 - self.playback_viewport_fraction) * window_secs;
+
+            self.frozen_view_end = Some(start + Duration::from_secs_f32(cursor_secs + extra_secs));
+        }
+
+        // Send All Notes Off (CC 123) to MIDI output to silence any hanging notes
+        if let Some(conn) = &mut self.out_connection {
+            // 0xB0 = Control Change on Channel 1, 123 = All Notes Off, 0 = value
+            // Repeat for channels 1-16 if we want to be thorough, but Ch1 is default usually.
+            // Let's just do Ch1 (0) for now.
+            let _ = conn.send(&[0xB0, 123, 0]);
         }
     }
 
@@ -1061,6 +1253,7 @@ impl MidiApp {
         self.chords.clear();
         self.save_path = Some(path.to_path_buf());
         self.chord_gen_pending = None;
+        self.cursor_pos = 0.0;
 
         Ok(())
     }
@@ -1078,6 +1271,7 @@ impl MidiApp {
         self.chords.clear();
         self.save_path = None;
         self.chord_gen_pending = None;
+        self.cursor_pos = 0.0;
         self.status = "New file".to_string();
     }
 
@@ -1150,6 +1344,79 @@ impl eframe::App for MidiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Playback logic
+        if self.playback_active {
+            if let Some(start) = self.playback_start_time {
+                let now = Instant::now();
+                let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+                let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                let elapsed_measures = now.duration_since(start).as_secs_f32() / measure_secs;
+                let new_cursor = self.playback_start_cursor + elapsed_measures;
+
+                // Play MIDI notes between self.cursor_pos and new_cursor
+                if let Some(conn) = &mut self.out_connection {
+                    for hit in &self.note_hits {
+                        // Note On
+                        if hit.start > self.cursor_pos && hit.start <= new_cursor {
+                            let _ = conn.send(&[0x90, hit.pitch, hit.velocity]);
+                        }
+                        // Note Off
+                        if let Some(end) = hit.end {
+                            if end > self.cursor_pos && end <= new_cursor {
+                                let _ = conn.send(&[0x80, hit.pitch, 0]);
+                            }
+                        }
+                    }
+                }
+
+                self.cursor_pos = new_cursor;
+
+                // Auto-stop if we passed the end
+                // We used to wait for max_end + 1.0 but that causes the "short distance" overrun issue.
+                // We should stop strictly at the max_end (or recording_ended_at) to avoid overshooting.
+
+                let note_max_end = self
+                    .note_hits
+                    .iter()
+                    .map(|h| h.end.unwrap_or(h.start))
+                    .fold(0.0, f32::max);
+
+                let mut overall_max_meas = note_max_end;
+
+                if let (Some(s), Some(e)) = (self.start_time, self.recording_ended_at) {
+                    if e > s {
+                        let dur_secs = e.duration_since(s).as_secs_f32();
+                        let dur_meas = dur_secs / measure_secs;
+                        if dur_meas > overall_max_meas {
+                            overall_max_meas = dur_meas;
+                        }
+                    }
+                }
+
+                if self.cursor_pos >= overall_max_meas {
+                    self.cursor_pos = overall_max_meas; // Clamp
+                    self.stop_playback();
+                }
+                ctx.request_repaint();
+            }
+        }
+
+        // Update recording cursor visual
+        if self.recording_enabled {
+            if let Some(start) = self.start_time {
+                let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                let beat_secs = quarter_secs * (4.0 / self.time_sig_b as f32);
+                let measure_secs = beat_secs * (self.time_sig_a as f32);
+
+                let elapsed = Instant::now().duration_since(start).as_secs_f32();
+                let current_measures = elapsed / measure_secs;
+                self.cursor_pos = current_measures.floor();
+                ctx.request_repaint();
+            }
+        }
+
         self.drain_messages();
 
         // Update window title to include opened file name (if any).
@@ -1205,8 +1472,15 @@ impl eframe::App for MidiApp {
             );
         }
 
-        // Spacebar toggles recording (only when a port is open). Use event-based detection for compatibility across egui versions.
-        let space_pressed = ctx.input(|i| i.key_pressed(egui::Key::Space));
+        // Keyboard shortcuts
+
+        // 1. Shift+Space for Recording (priority)
+        let record_shortcut_pressed =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space));
+
+        // 2. Space for Playback (if not consumed by recording)
+        let play_shortcut_pressed = !record_shortcut_pressed
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
 
         // Keyboard shortcuts (use `command` so Ctrl on Win/Linux and Cmd on macOS both work).
         // Use `consume_key` so handled shortcuts don't leak to other UI elements.
@@ -1219,11 +1493,8 @@ impl eframe::App for MidiApp {
             mods.shift = true;
             i.consume_key(mods, egui::Key::S)
         });
-        let save_pressed = if !save_as_pressed {
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
-        } else {
-            false
-        };
+        let save_pressed = !save_as_pressed
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
 
         if new_pressed {
             self.handle_new();
@@ -1242,12 +1513,21 @@ impl eframe::App for MidiApp {
             ctx.request_repaint();
         }
 
-        if space_pressed && self.connection.is_some() {
+        if record_shortcut_pressed && self.connection.is_some() && !self.playback_active {
             let is_recording = self.start_time.is_some() && self.scrolling_active;
             if is_recording {
                 self.stop_recording();
             } else {
                 self.start_recording(Instant::now());
+            }
+            ctx.request_repaint();
+        }
+
+        if play_shortcut_pressed && !self.recording_enabled {
+            if self.playback_active {
+                self.stop_playback();
+            } else {
+                self.start_playback();
             }
             ctx.request_repaint();
         }
@@ -1603,22 +1883,26 @@ impl eframe::App for MidiApp {
                                     // Keep a margin from the right edge
                                     ui.add_space(right_margin);
 
+                                    // Record Button
                                     let (rect, resp) = ui.allocate_exact_size(
                                         egui::vec2(sz, sz),
                                         egui::Sense::click(),
                                     );
-                                    let resp = resp.on_hover_text("Record (Space)");
+                                    let resp = resp.on_hover_text("Record (Shift+Space)");
 
                                     // determine state and colors
                                     let is_open = self.connection.is_some();
                                     let is_recording =
                                         self.start_time.is_some() && self.scrolling_active;
 
+                                    // Disable recording if playback is active
+                                    let recording_disabled = self.playback_active;
+
                                     let painter = ui.painter_at(rect);
                                     let center = rect.center();
                                     let radius = sz * 0.5;
 
-                                    if !is_open {
+                                    if !is_open || recording_disabled {
                                         // disabled gray circle
                                         painter.circle_filled(
                                             center,
@@ -1663,11 +1947,12 @@ impl eframe::App for MidiApp {
                                         );
                                     }
 
-                                    if resp.clicked() {
+                                    if resp.clicked() && !recording_disabled {
                                         if is_open {
                                             if is_recording {
                                                 // stop recording
                                                 self.stop_recording();
+                                                ctx.request_repaint();
                                             } else {
                                                 // start recording
                                                 self.start_recording(Instant::now());
@@ -1677,14 +1962,79 @@ impl eframe::App for MidiApp {
                                             self.open_selected(ctx);
                                         }
                                     }
+
+                                    ui.add_space(8.0); // gap between buttons
+
+                                    // Play Button
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(sz, sz),
+                                        egui::Sense::click(),
+                                    );
+                                    let resp = resp.on_hover_text("Play / Stop (Space)");
+                                    let painter = ui.painter_at(rect);
+                                    let center = rect.center();
+                                    let radius = sz * 0.5;
+
+                                    // Disable playback if recording is active
+                                    let playback_disabled = self.recording_enabled;
+
+                                    let bg = if playback_disabled {
+                                        egui::Color32::from_gray(70)
+                                    } else if self.playback_active {
+                                        egui::Color32::from_rgb(180, 160, 60) // Yellowish for pause/stop
+                                    } else {
+                                        egui::Color32::from_rgb(60, 160, 60) // Green for play
+                                    };
+                                    painter.circle_filled(center, radius, bg);
+
+                                    if self.playback_active {
+                                        // Square (Stop)
+                                        let s = radius * 0.7;
+                                        painter.rect_filled(
+                                            egui::Rect::from_center_size(center, egui::vec2(s, s)),
+                                            1.0,
+                                            egui::Color32::WHITE,
+                                        );
+                                        if resp.clicked() {
+                                            self.stop_playback();
+                                            ctx.request_repaint();
+                                        }
+                                    } else {
+                                        // Triangle (Play)
+                                        let s = radius * 0.5;
+                                        // Points: (center-s, center-s), (center-s, center+s), (center+s, center)
+                                        // Rotate 90 deg -> pointing right
+                                        let p1 = center + egui::vec2(-s * 0.5, -s * 0.8);
+                                        let p2 = center + egui::vec2(-s * 0.5, s * 0.8);
+                                        let p3 = center + egui::vec2(s * 0.9, 0.0);
+
+                                        let triangle_color = if playback_disabled {
+                                            egui::Color32::from_gray(140)
+                                        } else {
+                                            egui::Color32::WHITE
+                                        };
+
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![p1, p2, p3],
+                                            triangle_color,
+                                            egui::Stroke::NONE,
+                                        ));
+
+                                        if resp.clicked() && !playback_disabled {
+                                            self.start_playback();
+                                            ctx.request_repaint();
+                                        }
+                                    }
                                 },
                             );
                         });
 
                         ui_right.separator();
 
-                        let (r, resp) = ui_right
-                            .allocate_exact_size(egui::vec2(right_w, height), egui::Sense::drag());
+                        let (r, resp) = ui_right.allocate_exact_size(
+                            egui::vec2(right_w, height),
+                            egui::Sense::click_and_drag(),
+                        );
                         // Hint for users: indicate that the piano roll can be panned by dragging or using the mouse wheel
                         let hint = if self.recording_enabled {
                             "Panning disabled while recording"
@@ -1801,19 +2151,25 @@ impl eframe::App for MidiApp {
                         // `view_end` is mutable because mouse-wheel horizontal scrolling can switch the view into
                         // a frozen/manual mode by setting `frozen_view_end` and disabling `scrolling_active`.
                         let mut view_end = if self.scrolling_active {
-                            match self.scroll_mode {
-                                ScrollMode::Smooth => now,
-                                ScrollMode::Bar => {
-                                    if let Some(start) = self.start_time {
-                                        let elapsed = now.duration_since(start).as_secs_f32();
-                                        let measure_idx = (elapsed / measure_secs).floor();
-                                        start
-                                            + std::time::Duration::from_secs_f32(
-                                                (measure_idx + 1.0) * measure_secs,
-                                            )
-                                    } else {
-                                        // before the first note: keep a static window (no quantized jump)
-                                        now
+                            if self.playback_active {
+                                // If playing back, enforce lookahead so cursor stays at the same relative screen position
+                                let offset = (1.0 - self.playback_viewport_fraction) * window_secs;
+                                now + Duration::from_secs_f32(offset)
+                            } else {
+                                match self.scroll_mode {
+                                    ScrollMode::Smooth => now,
+                                    ScrollMode::Bar => {
+                                        if let Some(start) = self.start_time {
+                                            let elapsed = now.duration_since(start).as_secs_f32();
+                                            let measure_idx = (elapsed / measure_secs).floor();
+                                            start
+                                                + std::time::Duration::from_secs_f32(
+                                                    (measure_idx + 1.0) * measure_secs,
+                                                )
+                                        } else {
+                                            // before the first note: keep a static window (no quantized jump)
+                                            now
+                                        }
                                     }
                                 }
                             }
@@ -2073,12 +2429,15 @@ impl eframe::App for MidiApp {
 
                         // chord generation per beat
                         if let Some(start) = self.start_time.filter(|_| self.scrolling_active) {
-                            let elapsed = now.duration_since(start).as_secs_f32();
-                            // Generate chords up to including the current beat
-                            let quarter_secs = 60.0 / (self.tempo_bpm as f32);
-                            let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
-                            let target_len = (elapsed / beat_secs).floor() as usize + 1;
-                            self.ensure_chords_accumulated(target_len);
+                            // Don't generate chords during playback
+                            if !self.playback_active {
+                                let elapsed = now.duration_since(start).as_secs_f32();
+                                // Generate chords up to including the current beat
+                                let quarter_secs = 60.0 / (self.tempo_bpm as f32);
+                                let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
+                                let target_len = (elapsed / beat_secs).floor() as usize + 1;
+                                self.ensure_chords_accumulated(target_len);
+                            }
                         }
 
                         // draw hits as rectangles spanning start..end (or start..view_end if active)
@@ -2205,6 +2564,83 @@ impl eframe::App for MidiApp {
                                     egui::FontId::monospace(12.0),
                                     egui::Color32::WHITE,
                                 );
+                            }
+                        }
+
+                        // Draw Playback Cursor "I" and handle clicks
+                        // Do this last so it overlays the notes and grid
+                        {
+                            let cursor_color = egui::Color32::from_rgb(255, 200, 0); // Gold/Orange
+                            let mut cursor_x_opt = None;
+
+                            // Map cursor_pos (measures) to screen X
+                            if let Some(start) = self.start_time {
+                                // Dynamic window logic: [view_end - window_secs, view_end]
+                                let elapsed = view_end.duration_since(start).as_secs_f32();
+                                let view_start_secs = elapsed - window_secs;
+                                let cursor_secs = self.cursor_pos * measure_secs;
+
+                                if cursor_secs >= view_start_secs && cursor_secs <= elapsed {
+                                    let fraction = (cursor_secs - view_start_secs) / window_secs;
+                                    cursor_x_opt =
+                                        Some(grid_left + fraction * (grid_right - grid_left));
+                                }
+                            } else {
+                                // Static view logic: [0, measures]
+                                if self.cursor_pos >= 0.0 && self.cursor_pos <= self.measures as f32
+                                {
+                                    let fraction = self.cursor_pos / (self.measures as f32);
+                                    cursor_x_opt =
+                                        Some(grid_left + fraction * (grid_right - grid_left));
+                                }
+                            }
+
+                            if let Some(cx) = cursor_x_opt {
+                                painter.line_segment(
+                                    [egui::pos2(cx, grid_top), egui::pos2(cx, grid_bottom)],
+                                    egui::Stroke::new(2.0, cursor_color),
+                                );
+                                // I-beam caps
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(cx - 3.0, grid_top),
+                                        egui::pos2(cx + 3.0, grid_top),
+                                    ],
+                                    egui::Stroke::new(2.0, cursor_color),
+                                );
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(cx - 3.0, grid_bottom),
+                                        egui::pos2(cx + 3.0, grid_bottom),
+                                    ],
+                                    egui::Stroke::new(2.0, cursor_color),
+                                );
+                            }
+
+                            // Handle Clicks to set cursor
+                            if resp.clicked_by(egui::PointerButton::Primary)
+                                && !resp.dragged()
+                                && !self.recording_enabled
+                                && !self.playback_active
+                            {
+                                if let Some(pos) = resp.interact_pointer_pos() {
+                                    let x = pos.x;
+                                    let fraction = (x - grid_left) / (grid_right - grid_left);
+                                    let clamped_frac = fraction.clamp(0.0, 1.0);
+
+                                    let new_cursor_measures = if let Some(start) = self.start_time {
+                                        let elapsed = view_end.duration_since(start).as_secs_f32();
+                                        let view_start_secs = elapsed - window_secs;
+                                        let time_secs =
+                                            view_start_secs + clamped_frac * window_secs;
+                                        time_secs / measure_secs
+                                    } else {
+                                        clamped_frac * (self.measures as f32)
+                                    };
+
+                                    self.cursor_pos = new_cursor_measures.max(0.0);
+                                    ctx.request_repaint();
+                                }
                             }
                         }
                     },
