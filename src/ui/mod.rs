@@ -854,7 +854,8 @@ impl MidiApp {
                 next_measure.saturating_sub(1)
             };
 
-            // Build normalized NoteData for the measure (or previous beat when in Beat mode).
+            // Build absolute-measure normalized NoteData for the measure (or previous beat when in Beat mode).
+            // start/end are absolute measure units (e.g., 4.25 = measure 4 + 0.25).
             let notes_for_measure: Vec<crate::algo_load::NoteData> = {
                 let mut notes = Vec::new();
                 // Seconds per quarter note, then convert quarter -> beat using denominator `b` (b=4 => beat=quarter)
@@ -902,35 +903,28 @@ impl MidiApp {
                             }
                         }
 
-                        // Normalize start/end within the source measure (keep measure-based normalization).
-                        let s_norm = if s_elapsed <= measure_start {
-                            0.0
-                        } else {
-                            ((s_elapsed - measure_start) / measure_secs)
-                                .clamp(0.0, 1.0 + lookahead_extra)
-                        };
+                        // Base measure for this beat-source
+                        let base_measure = prev_measure as f32;
 
-                        let e_norm = match hit.end {
-                            Some(e) => {
-                                let e_elapsed = e * measure_secs;
-                                if e_elapsed >= beat_end_secs {
-                                    ((beat_end_secs - measure_start) / measure_secs)
-                                        .min(1.0 + lookahead_extra)
-                                } else {
-                                    ((e_elapsed - measure_start) / measure_secs)
-                                        .clamp(0.0, 1.0 + lookahead_extra)
-                                }
-                            }
-                            None => ((beat_end_secs - measure_start) / measure_secs)
-                                .min(1.0 + lookahead_extra),
-                        };
+                        // Beat-end in measure units
+                        let beat_end_measure = (beat_end_secs / measure_secs) as f32;
+
+                        // Compute absolute start/end directly from hit.* (already in measure units), but clamp to the source measure window
+                        let abs_start = hit
+                            .start
+                            .clamp(base_measure, base_measure + 1.0 + lookahead_extra);
+
+                        let raw_end = hit.end.unwrap_or(beat_end_measure);
+                        let raw_end = raw_end.min(beat_end_measure);
+                        let abs_end =
+                            raw_end.clamp(base_measure, base_measure + 1.0 + lookahead_extra);
 
                         let v_norm = (hit.velocity as f32) / 127.0;
 
                         notes.push(crate::algo_load::NoteData {
                             pitch: hit.pitch as i32,
-                            start: s_norm,
-                            end: e_norm,
+                            start: abs_start,
+                            end: abs_end,
                             velocity: v_norm,
                         });
                     }
@@ -960,36 +954,25 @@ impl MidiApp {
                             }
                         }
 
-                        // Normalize start/end within the source measure.
-                        // Notes started in a previous measure => start=0.0.
-                        let s_norm = if s_elapsed <= measure_start {
-                            0.0
-                        } else {
-                            ((s_elapsed - measure_start) / measure_secs)
-                                .clamp(0.0, 1.0 + lookahead_extra)
-                        };
+                        // Base measure for this source
+                        let base_measure = src_measure as f32;
 
-                        // Notes still active at the measure boundary => end=1.0 (或更大)
-                        let e_norm = match hit.end {
-                            Some(e) => {
-                                let e_elapsed = e * measure_secs;
-                                if e_elapsed >= measure_end {
-                                    1.0 + lookahead_extra
-                                } else {
-                                    ((e_elapsed - measure_start) / measure_secs)
-                                        .clamp(0.0, 1.0 + lookahead_extra)
-                                }
-                            }
-                            None => 1.0 + lookahead_extra,
-                        };
+                        // Compute absolute start/end directly and clamp to the measure window
+                        let abs_start = hit
+                            .start
+                            .clamp(base_measure, base_measure + 1.0 + lookahead_extra);
+
+                        let raw_end = hit.end.unwrap_or(base_measure + 1.0 + lookahead_extra);
+                        let abs_end =
+                            raw_end.clamp(base_measure, base_measure + 1.0 + lookahead_extra);
 
                         // Normalize velocity to [0,1] (MIDI velocities are 0..127)
                         let v_norm = (hit.velocity as f32) / 127.0;
 
                         notes.push(crate::algo_load::NoteData {
                             pitch: hit.pitch as i32,
-                            start: s_norm,
-                            end: e_norm,
+                            start: abs_start,
+                            end: abs_end,
                             velocity: v_norm,
                         });
                     }
@@ -1012,24 +995,29 @@ impl MidiApp {
                     note.velocity
                 );
             }
-            // Generate ONE chord for the current beat
+            // Generate ONE chord for the current beat (or the whole measure when in Measure mode)
             let num_beats = if self.chord_update_frequency == ChordUpdateFrequency::Beat {
                 1u32
             } else {
                 self.time_sig_a as u32
             };
+            let beat_start = next_idx as u32;
+            let beat_end = beat_start + num_beats;
             let chord = generate_chord_for_measure(
                 last_chord,
                 sample_fn,
                 &notes_for_measure,
                 self.time_sig_a as u32,
-                num_beats,
+                beat_start,
+                beat_end,
             );
             let elapsed = start.elapsed();
             println!(
-                "Generated chord for measure {} beat {}:\t{:032b} [{} ns]",
+                "Generated chord for measure {} beat {} (beats {}..{}):\t{:032b} [{} ns]",
                 next_measure,
                 next_beat,
+                beat_start,
+                beat_end,
                 chord.get_data(),
                 elapsed.as_nanos()
             );
