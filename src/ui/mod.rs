@@ -721,8 +721,8 @@ impl MidiApp {
                                 }
                             }
                         }
-                        // Only record note hits if recording has started (start_time set)
-                        if self.start_time.is_some() {
+                        // Only record note hits when recording is enabled and recording has started (start_time set)
+                        if self.recording_enabled && self.start_time.is_some() {
                             // measure length in seconds at the current tempo/signature
                             let quarter_secs = 60.0 / (self.tempo_bpm as f32);
                             let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
@@ -743,7 +743,7 @@ impl MidiApp {
                         }
                     }
                     NoteAction::Off { pitch, time } => {
-                        if self.start_time.is_some() {
+                        if self.recording_enabled && self.start_time.is_some() {
                             // measure length in seconds at the current tempo/signature
                             let quarter_secs = 60.0 / (self.tempo_bpm as f32);
                             let beat_secs = quarter_secs * (4.0_f32 / self.time_sig_b as f32);
