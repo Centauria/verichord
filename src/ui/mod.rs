@@ -50,6 +50,7 @@ pub struct MidiApp {
     save_path: Option<PathBuf>,
     scrolling_active: bool,
     frozen_view_end: Option<Instant>,
+    view_frozen_by_user: bool,
     recording_ended_at: Option<Instant>,
     /// True when user has started recording (via Record button / Space). MIDI input shouldn't auto-start recording when false.
     recording_enabled: bool,
@@ -122,6 +123,7 @@ impl Default for MidiApp {
             save_path: None,
             scrolling_active: false,
             frozen_view_end: None,
+            view_frozen_by_user: false,
             recording_ended_at: None,
             recording_enabled: false,
 
@@ -407,6 +409,7 @@ impl MidiApp {
         self.start_time = Some(anchor);
         self.scrolling_active = true;
         self.frozen_view_end = None;
+        self.view_frozen_by_user = false;
         self.chord_gen_pending = None;
 
         // If the selected algorithm provides reset_state(), call it before clearing generated content
@@ -594,6 +597,7 @@ impl MidiApp {
         self.playback_start_cursor = self.cursor_pos;
         self.scrolling_active = true;
         self.frozen_view_end = None; // Unfreeze view to follow cursor
+        self.view_frozen_by_user = false;
         self.status = "Playback started".to_string();
 
         // Update metronome anchor if active
@@ -2116,8 +2120,8 @@ impl eframe::App for MidiApp {
                                     }
                                 }
                                 self.frozen_view_end = Some(new_fve);
-                                // Ensure we stay in frozen mode (though dragged() implies it)
-                                self.scrolling_active = false;
+                                // Mark view as user-frozen (keeps metronome & generation running)
+                                self.view_frozen_by_user = true;
                             }
                         }
 
@@ -2138,7 +2142,7 @@ impl eframe::App for MidiApp {
                         // Determine view_end: if scrolling is active compute normally, otherwise freeze to `frozen_view_end` (or now)
                         // `view_end` is mutable because mouse-wheel horizontal scrolling can switch the view into
                         // a frozen/manual mode by setting `frozen_view_end` and disabling `scrolling_active`.
-                        let mut view_end = if self.scrolling_active {
+                        let mut view_end = if self.scrolling_active && !self.view_frozen_by_user {
                             if self.playback_active {
                                 // If playing back, enforce lookahead so cursor stays at the same relative screen position
                                 let offset = (1.0 - self.playback_viewport_fraction) * window_secs;
@@ -2214,7 +2218,8 @@ impl eframe::App for MidiApp {
                                 }
 
                                 self.frozen_view_end = Some(new_fve);
-                                self.scrolling_active = false; // switch to manual/frozen mode
+                                // Mark view as user-frozen (keep metronome running)
+                                self.view_frozen_by_user = true; // switch to manual/frozen mode
                                 // Recompute view_end to reflect the new frozen value
                                 view_end = self.frozen_view_end.unwrap_or(now);
                                 ui_right.ctx().request_repaint();
